@@ -16,8 +16,6 @@ static uint8_t _delayMs = HID_DEFAULT_DELAY_MS;
 
 void hidBegin() {
     Keyboard.begin();
-    // USB.begin() must be called by main.cpp AFTER hidBegin() so
-    // the HID descriptor is registered before TinyUSB enumerates.
 }
 
 void hidSetKeystrokeDelay(uint8_t ms) {

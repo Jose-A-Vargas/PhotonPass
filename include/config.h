@@ -25,7 +25,9 @@
 // Wired in parallel with the GM60 trigger input so one press simultaneously
 // signals the MCU and fires the scanner hardware.
 // Assign to whichever GPIO is free on your board (XIAO ESP32S3 Plus module pad).
+#ifndef PIN_SCAN_BTN
 #define PIN_SCAN_BTN        39   // MTCK back pad (GPIO 39) — all D0-D10 are taken by display/touch/scanner
+#endif
 #define SCAN_BTN_TIMEOUT_MS 3000  // max wait for a frame after button press
 
 // ============================================================
