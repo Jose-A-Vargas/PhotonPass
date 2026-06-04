@@ -490,10 +490,11 @@ static void testBackup() {
     memcpy(savedUuid, r.uuid, 16);
     logHex("record uuid", savedUuid, 16);
 
-    log("calling backupExport -- auto-generates BACKUP_KEY, writes /backup.bin");
-    bool exported = backupExport(vs);
-    tprintf("  backupExport returned %d  records after export: %u\n",
-            (int)exported, (unsigned)vs.records.size());
+    char bkpFilename[BACKUP_FILENAME_MAX] = {};
+    log("calling backupExport -- auto-generates BACKUP_KEY, writes to DMZ");
+    bool exported = backupExport(vs, bkpFilename, sizeof(bkpFilename));
+    tprintf("  backupExport returned %d  filename: %s  records after export: %u\n",
+            (int)exported, bkpFilename, (unsigned)vs.records.size());
     if (exported) ok("backupExport");
     else        { fail("backupExport"); return; }
 
@@ -508,9 +509,10 @@ static void testBackup() {
     tprintf("  records remaining before import: %u\n", (unsigned)vs.records.size());
 
     log("calling backupImport");
-    int result = backupImport(vs);
-    tprintf("  backupImport returned %d  records after import: %u\n",
-            result, (unsigned)vs.records.size());
+    int found2 = 0;
+    int result = backupImport(vs, bkpFilename, &found2);
+    tprintf("  backupImport returned %d  found=%d  records after import: %u\n",
+            result, found2, (unsigned)vs.records.size());
     if (result >= 0) ok("backupImport success");
     else {
         char msg[24]; snprintf(msg, sizeof(msg), "returned %d", result);
@@ -531,7 +533,7 @@ static void testBackup() {
     VaultState empty;
     generateSalt(empty.salt);
     empty.unlocked = true;  // must be unlocked or it returns -1 (locked guard) before checking key
-    int r2 = backupImport(empty);
+    int r2 = backupImport(empty, bkpFilename);
     tprintf("  backupImport(no key) returned %d (want -4)\n", r2);
     if (r2 == -4) ok("backupImport returns -4 (no BACKUP_KEY)");
     else {

@@ -51,7 +51,7 @@
 // ============================================================
 #define VAULT_FILE_PATH         "/vault.bin"
 #define VAULT_VERSION           1
-#define VAULT_MAX_RECORDS       128
+#define VAULT_MAX_RECORDS       256
 #define VAULT_HISTORY_WEB       10   // most record types
 #define VAULT_HISTORY_PC        40   // PC_ACCOUNT records
 

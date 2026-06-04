@@ -151,13 +151,20 @@ bool saveVault(const VaultState& state, const char* path) {
     const size_t aadLen = offsetof(VaultHeader, tag);
 
     std::vector<uint8_t> cipher(plaintext.size());
+
+    // mbedtls rejects null pointers even when length is 0 (empty vault).
+    // Use a non-null dummy so GCM still produces a valid auth tag over the AAD.
+    static const uint8_t kEmptyIn[1]  = {0};
+    static       uint8_t kEmptyOut[1] = {0};
+    const uint8_t* ptPtr = plaintext.empty() ? kEmptyIn  : plaintext.data();
+    uint8_t*       ctPtr = cipher.empty()    ? kEmptyOut : cipher.data();
+
     CryptoResult res = encryptGCM(
         state.masterKey,
         hdr.nonce,
         (const uint8_t*)&hdr, aadLen,
-        plaintext.data(),     plaintext.size(),
-        cipher.data(),
-        hdr.tag
+        ptPtr, plaintext.size(),
+        ctPtr, hdr.tag
     );
 
     secureClear(plaintext.data(), plaintext.size());

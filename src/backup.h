@@ -1,60 +1,64 @@
 #pragma once
 #include <stdint.h>
+#include <stddef.h>
 #include "vault.h"
 
 // ============================================================
-// PhotonPass encrypted backup — DMZ LittleFS partition
+// PhotonPass encrypted backup — DMZ FAT partition (5 MB, label "dmz")
 //
-// File: /backup.bin on the "dmz" partition (5 MB, label "dmz").
-// The "dmz" partition is mounted only on explicit user request
-// and unmounted immediately after use.
+// Backup filenames: {CHIPID}{NNNN}.BKP  (8.3-compatible FAT name)
+//   CHIPID  — 4 uppercase hex chars from the chip's efuse MAC
+//   NNNN    — 4-digit auto-increment counter per chip (0001–9999)
+//   Example:  F8980003.BKP
 //
-// Backup file layout:
-//   BackupHeader (56 bytes, partially unencrypted):
-//     magic[4]       = "PPBK"
-//     version[1]     = BACKUP_VERSION
-//     flags[1]       = 0
-//     recordCount[2]
-//     keyUuid[16]    = UUID of the BACKUP_KEY vault record used
-//     nonce[12]      = fresh random on every export
-//     ---- AAD boundary (offset 36) ----
-//     tag[16]        = AES-256-GCM auth tag
-//     payloadLen[4]  = encrypted payload byte length
-//   AES-256-GCM ciphertext (serialized vault records)
-//
-// Key convention: BACKUP_KEY vault records store the 32-byte
-// random key as a 64-char uppercase hex string in the password
-// field (identical convention to PRESHARE_KEY for sync).
-//
-// If no BACKUP_KEY record exists when backupExport() is called,
-// one is auto-generated and saved to the vault.
+// The file is AES-256-GCM encrypted using a per-vault BACKUP_KEY record.
+// The BACKUP_KEY's 64-char hex value must be noted for disaster recovery
+// (vault wipe + re-init loses the BACKUP_KEY record).
 // ============================================================
 
-#define BACKUP_FILE_PATH  "/backup.bin"
-#define BACKUP_VERSION    1
-#define BACKUP_MAGIC_0    0x50   // 'P'
-#define BACKUP_MAGIC_1    0x50   // 'P'
-#define BACKUP_MAGIC_2    0x42   // 'B'
-#define BACKUP_MAGIC_3    0x4B   // 'K'
+#define BACKUP_FILENAME_MAX  16   // "XXXXXXXX.BKP" + null = 13, 16 for alignment
+#define BACKUP_EXT           ".BKP"
+#define BACKUP_VERSION       1
+#define BACKUP_MAGIC_0       0x50   // 'P'
+#define BACKUP_MAGIC_1       0x50   // 'P'
+#define BACKUP_MAGIC_2       0x42   // 'B'
+#define BACKUP_MAGIC_3       0x4B   // 'K'
 
-// Mount / unmount the 5 MB DMZ LittleFS partition.
-// dmzMount() is idempotent if already mounted.
+// Mount / unmount the DMZ FAT partition explicitly.
+// dmzMount() is idempotent; dmzUnmount() is a no-op if not mounted.
 bool dmzMount();
 void dmzUnmount();
 
-// Encrypt all vault records with the BACKUP_KEY and write to DMZ /backup.bin.
-// Auto-generates a BACKUP_KEY vault record if none exists.
-// Returns false on any error (mount failure, I/O, crypto).
-bool backupExport(VaultState& vault);
+// Fill out[5] with 4 uppercase hex chars identifying this chip (efuse MAC).
+void backupChipId(char out[5]);
 
-// Read DMZ /backup.bin, decrypt with the matching BACKUP_KEY (found by UUID),
-// and merge records into vault (keep newest lastChanged on UUID collision).
-//
-// Return value:
-//   >= 0  : success — number of records updated (0 = already up to date)
-//     -1  : mount or I/O error (includes file-not-found)
-//     -2  : invalid backup format (bad magic / version)
-//     -3  : authentication failed (GCM tag mismatch)
-//     -4  : no matching BACKUP_KEY in current vault
-//     -5  : out of memory
-int backupImport(VaultState& vault);
+// Encrypt all vault records and write a uniquely-named backup file to DMZ.
+// Auto-generates a BACKUP_KEY record in vault if none exists.
+// Writes the generated filename (without leading '/') into outName if provided.
+// Returns false on any error.
+bool backupExport(VaultState& vault,
+                  char*  outName    = nullptr,
+                  size_t outNameLen = 0);
+
+// List .BKP files on DMZ. Calls cb(index, bare_filename) for each.
+// Returns total count found. DMZ is mounted/unmounted internally.
+int backupListFiles(void (*cb)(int idx, const char* name));
+
+// Decrypt and merge a named backup file into vault.
+//   outFound — receives total record count from backup (optional)
+//   hexKey   — 64-char hex key for disaster recovery when BACKUP_KEY is gone (optional)
+// Return: merged count (>=0) or error code.
+//   -1  mount or I/O error      -3  authentication failed (wrong key)
+//   -2  bad backup format       -4  BACKUP_KEY not found / invalid
+//                               -5  out of memory
+int backupImport(VaultState&  vault,
+                 const char*  filename,
+                 int*         outFound = nullptr,
+                 const char*  hexKey   = nullptr);
+
+// Read a backup file from DMZ into caller-provided buffer.
+// Returns bytes read (0 on failure).
+size_t backupReadFile(const char* filename, uint8_t* buf, size_t maxLen);
+
+// Delete a backup file from DMZ. Returns true on success.
+bool backupDeleteFile(const char* filename);

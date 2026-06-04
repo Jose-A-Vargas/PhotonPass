@@ -1,16 +1,13 @@
 #include "backup.h"
 #include "crypto.h"
-#include <LittleFS.h>
+#include <FFat.h>
+#include <Arduino.h>
 #include <esp_random.h>
 #include <string.h>
 #include <stddef.h>
 #include <stdio.h>
 
-// The DMZ LittleFS instance is independent of the vault LittleFS global.
-// ESP32 Arduino allows multiple LITTLEFSFS objects, each mounting a
-// separate flash partition by label.
-static fs::LittleFSFS sDmzFS;
-static bool       sDmzMounted = false;
+static bool sDmzMounted = false;
 
 // ============================================================
 // DMZ mount helpers
@@ -18,30 +15,29 @@ static bool       sDmzMounted = false;
 
 bool dmzMount() {
     if (sDmzMounted) return true;
-    sDmzMounted = sDmzFS.begin(true, "/dmz", 10, "dmz");
+    sDmzMounted = FFat.begin(true, "/dmz", 10, "dmz");
     return sDmzMounted;
 }
 
 void dmzUnmount() {
     if (!sDmzMounted) return;
-    sDmzFS.end();
+    FFat.end();
     sDmzMounted = false;
 }
 
 // ============================================================
-// Backup file header
-// AAD = bytes [0, offsetof(BackupHeader, tag))  = first 36 bytes.
+// Backup file header (AAD boundary at offset 36)
 // ============================================================
 
 #pragma pack(push, 1)
 struct BackupHeader {
-    uint8_t  magic[4];              // "PPBK"
-    uint8_t  version;               // BACKUP_VERSION
-    uint8_t  flags;                 // reserved, must be 0
+    uint8_t  magic[4];
+    uint8_t  version;
+    uint8_t  flags;
     uint16_t recordCount;
-    uint8_t  keyUuid[16];           // UUID of the BACKUP_KEY record used
-    uint8_t  nonce[GCM_NONCE_LEN];  // fresh random on every export
-    // --- AAD boundary at offset 36 ---
+    uint8_t  keyUuid[16];
+    uint8_t  nonce[GCM_NONCE_LEN];
+    // --- AAD boundary ---
     uint8_t  tag[GCM_TAG_LEN];
     uint32_t payloadLen;
 };
@@ -51,13 +47,13 @@ static_assert(offsetof(BackupHeader, tag) == 36, "BackupHeader AAD boundary move
 static_assert(sizeof(BackupHeader)         == 56, "BackupHeader size changed");
 
 // ============================================================
-// Hex key helpers (same convention as sync PRESHARE_KEY)
+// Internal helpers
 // ============================================================
 
 static bool hexDecodeKey(const char* hex, uint8_t* outKey) {
     if (!hex || strlen(hex) != 64) return false;
     for (int i = 0; i < AES_KEY_LEN; i++) {
-        char hi = hex[2 * i], lo = hex[2 * i + 1];
+        char hi = hex[2*i], lo = hex[2*i+1];
         auto nib = [](char c) -> int {
             if (c >= '0' && c <= '9') return c - '0';
             if (c >= 'A' && c <= 'F') return c - 'A' + 10;
@@ -71,22 +67,16 @@ static bool hexDecodeKey(const char* hex, uint8_t* outKey) {
     return true;
 }
 
-// ============================================================
-// Auto-generate a BACKUP_KEY record if none exists
-// ============================================================
-
-// Adds a new BACKUP_KEY record to vault.records, saves the vault,
-// and returns a pointer to the new record.  Returns nullptr on save error.
-static const VaultRecord* createBackupKey(VaultState& vault) {
+// Always generates a fresh key tied to a specific backup filename.
+// username = bare filename (e.g. "FC980001.BKP") so import can match exactly.
+static const VaultRecord* createBackupKey(VaultState& vault, const char* filename) {
     VaultRecord rec;
     generateUUID(rec.uuid);
     rec.type        = RecordType::BACKUP_KEY;
     rec.domain      = "PhotonPass Backup";
-    rec.username    = "";
-    rec.queryValue  = "";
+    rec.username    = filename;   // exact filename this key unlocks
     rec.lastChanged = 0;
 
-    // 32 TRNG bytes → 64-char uppercase hex key
     uint8_t rawKey[AES_KEY_LEN];
     for (int i = 0; i < AES_KEY_LEN; i += 4) {
         uint32_t rnd = esp_random();
@@ -94,7 +84,7 @@ static const VaultRecord* createBackupKey(VaultState& vault) {
     }
     char hexStr[65];
     for (int i = 0; i < AES_KEY_LEN; i++)
-        snprintf(hexStr + 2 * i, 3, "%02X", rawKey[i]);
+        snprintf(hexStr + 2*i, 3, "%02X", rawKey[i]);
     hexStr[64] = '\0';
     secureClear(rawKey, sizeof(rawKey));
 
@@ -102,30 +92,43 @@ static const VaultRecord* createBackupKey(VaultState& vault) {
     secureClear(hexStr, sizeof(hexStr));
 
     vault.records.push_back(std::move(rec));
-
-    if (!saveVault(vault)) {
-        vault.records.pop_back();  // rollback
-        return nullptr;
-    }
+    if (!saveVault(vault)) { vault.records.pop_back(); return nullptr; }
     return &vault.records.back();
+}
+
+// ============================================================
+// Chip identifier
+// ============================================================
+
+void backupChipId(char out[5]) {
+    uint64_t mac = ESP.getEfuseMac();
+    // MAC is stored LE in the uint64_t: byte0=bits[0..7] ... byte5=bits[40..47]
+    uint8_t b4 = (uint8_t)((mac >> 32) & 0xFF);
+    uint8_t b5 = (uint8_t)((mac >> 40) & 0xFF);
+    snprintf(out, 5, "%02X%02X", b4, b5);
 }
 
 // ============================================================
 // Export
 // ============================================================
 
-bool backupExport(VaultState& vault) {
+bool backupExport(VaultState& vault, char* outName, size_t outNameLen) {
     if (!vault.unlocked) return false;
 
-    // Find or auto-create the BACKUP_KEY
-    const VaultRecord* keyRec = nullptr;
-    for (const auto& r : vault.records) {
-        if (r.type == RecordType::BACKUP_KEY) { keyRec = &r; break; }
+    // Pick the filename first so it can be stored in the key record.
+    if (!dmzMount()) return false;
+    char chipId[5]; backupChipId(chipId);
+    char path[BACKUP_FILENAME_MAX + 2];
+    for (int n = 1; n <= 9999; n++) {
+        snprintf(path, sizeof(path), "/%s%04d.BKP", chipId, n);
+        if (!FFat.exists(path)) break;
     }
-    if (!keyRec) {
-        keyRec = createBackupKey(vault);
-        if (!keyRec) return false;
-    }
+    dmzUnmount();  // unmount before saveVault (which writes main LittleFS)
+
+    // Always generate a fresh key for this file — never reuse.
+    const char* bareName = path + 1;  // strip leading '/'
+    const VaultRecord* keyRec = createBackupKey(vault, bareName);
+    if (!keyRec) return false;
 
     uint8_t backupKey[AES_KEY_LEN];
     if (!hexDecodeKey(keyRec->password.c_str(), backupKey)) return false;
@@ -133,54 +136,93 @@ bool backupExport(VaultState& vault) {
     auto plain = serializeRecords(vault.records);
 
     BackupHeader hdr;
-    hdr.magic[0]    = BACKUP_MAGIC_0;
-    hdr.magic[1]    = BACKUP_MAGIC_1;
-    hdr.magic[2]    = BACKUP_MAGIC_2;
-    hdr.magic[3]    = BACKUP_MAGIC_3;
+    hdr.magic[0] = BACKUP_MAGIC_0; hdr.magic[1] = BACKUP_MAGIC_1;
+    hdr.magic[2] = BACKUP_MAGIC_2; hdr.magic[3] = BACKUP_MAGIC_3;
     hdr.version     = BACKUP_VERSION;
     hdr.flags       = 0;
     hdr.recordCount = (uint16_t)vault.records.size();
     memcpy(hdr.keyUuid, keyRec->uuid, 16);
     generateNonce(hdr.nonce);
-    hdr.payloadLen  = (uint32_t)plain.size();
+    hdr.payloadLen = (uint32_t)plain.size();
 
     const size_t aadLen = offsetof(BackupHeader, tag);
-
     std::vector<uint8_t> cipher(plain.size());
+
+    static const uint8_t kEmptyIn[1]  = {0};
+    static       uint8_t kEmptyOut[1] = {0};
+    const uint8_t* ptPtr = plain.empty() ? kEmptyIn  : plain.data();
+    uint8_t*       ctPtr = cipher.empty() ? kEmptyOut : cipher.data();
+
     CryptoResult res = encryptGCM(
         backupKey, hdr.nonce,
         (const uint8_t*)&hdr, aadLen,
-        plain.data(), plain.size(),
-        cipher.data(), hdr.tag
-    );
+        ptPtr, plain.size(), ctPtr, hdr.tag);
     secureClear(backupKey, sizeof(backupKey));
     secureClear(plain.data(), plain.size());
-
     if (res != CryptoResult::OK) return false;
 
     if (!dmzMount()) return false;
-
-    File f = sDmzFS.open(BACKUP_FILE_PATH, FILE_WRITE);
+    File f = FFat.open(path, FILE_WRITE);
     if (!f) { dmzUnmount(); return false; }
-
     f.write((const uint8_t*)&hdr, sizeof(hdr));
-    f.write(cipher.data(), cipher.size());
+    if (!cipher.empty()) f.write(cipher.data(), cipher.size());
     f.close();
-
     dmzUnmount();
+
+    if (outName && outNameLen > 0)
+        strncpy(outName, bareName, outNameLen - 1);
+
     return true;
+}
+
+// ============================================================
+// List
+// ============================================================
+
+int backupListFiles(void (*cb)(int idx, const char* name)) {
+    if (!dmzMount()) return 0;
+
+    File root = FFat.open("/");
+    if (!root || !root.isDirectory()) { dmzUnmount(); return 0; }
+
+    int count = 0;
+    for (;;) {
+        File f = root.openNextFile();
+        if (!f) break;
+        if (!f.isDirectory()) {
+            const char* raw = f.name();
+            // name() may return with or without leading '/'; strip it
+            const char* name = (raw[0] == '/') ? raw + 1 : raw;
+            size_t len = strlen(name);
+            if (len > 4 && strcasecmp(name + len - 4, ".bkp") == 0) {
+                if (cb) cb(count, name);
+                count++;
+            }
+        }
+        f.close();
+    }
+    root.close();
+    dmzUnmount();
+    return count;
 }
 
 // ============================================================
 // Import
 // ============================================================
 
-int backupImport(VaultState& vault) {
+int backupImport(VaultState& vault, const char* filename,
+                 int* outFound, const char* hexKey) {
+    if (outFound) *outFound = 0;
     if (!vault.unlocked) return -1;
-
     if (!dmzMount()) return -1;
 
-    File f = sDmzFS.open(BACKUP_FILE_PATH, FILE_READ);
+    char path[BACKUP_FILENAME_MAX + 2];
+    if (filename[0] != '/')
+        snprintf(path, sizeof(path), "/%s", filename);
+    else
+        strncpy(path, filename, sizeof(path) - 1);
+
+    File f = FFat.open(path, FILE_READ);
     if (!f) { dmzUnmount(); return -1; }
 
     BackupHeader hdr;
@@ -194,42 +236,45 @@ int backupImport(VaultState& vault) {
         f.close(); dmzUnmount(); return -2;
     }
 
-    // Sanity-check payload size: 256 KB is far more than any realistic vault
-    if (hdr.payloadLen == 0 || hdr.payloadLen > 0x40000) {
-        f.close(); dmzUnmount(); return -2;
-    }
+    if (hdr.payloadLen > 0x40000) { f.close(); dmzUnmount(); return -2; }
 
     std::vector<uint8_t> cipher(hdr.payloadLen);
-    if (f.read(cipher.data(), hdr.payloadLen) != (int)hdr.payloadLen) {
+    if (hdr.payloadLen > 0 &&
+        f.read(cipher.data(), hdr.payloadLen) != (int)hdr.payloadLen) {
         f.close(); dmzUnmount(); return -1;
     }
     f.close();
     dmzUnmount();
 
-    // Find matching BACKUP_KEY by UUID stored in the header
-    const VaultRecord* keyRec = nullptr;
-    for (const auto& r : vault.records) {
-        if (r.type == RecordType::BACKUP_KEY &&
-            memcmp(r.uuid, hdr.keyUuid, 16) == 0) {
-            keyRec = &r;
-            break;
-        }
-    }
-    if (!keyRec) return -4;
-
     uint8_t backupKey[AES_KEY_LEN];
-    if (!hexDecodeKey(keyRec->password.c_str(), backupKey)) return -4;
+    if (hexKey) {
+        if (!hexDecodeKey(hexKey, backupKey)) return -4;
+    } else {
+        // Match BACKUP_KEY whose username is exactly this filename.
+        // Each export creates a unique key stored under the filename it protects.
+        const char* bareName = (path[0] == '/') ? path + 1 : path;
+        const VaultRecord* keyRec = nullptr;
+        for (const auto& r : vault.records)
+            if (r.type == RecordType::BACKUP_KEY &&
+                strcasecmp(r.username.c_str(), bareName) == 0)
+                { keyRec = &r; break; }
+        if (!keyRec) return -4;  // prompts user for hex key in cmdRestore
+        if (!hexDecodeKey(keyRec->password.c_str(), backupKey)) return -4;
+    }
 
     const size_t aadLen = offsetof(BackupHeader, tag);
-    std::vector<uint8_t> plain(hdr.payloadLen);
+    std::vector<uint8_t> plain(hdr.payloadLen ? hdr.payloadLen : 1);
+
+    static const uint8_t kEmptyIn[1]  = {0};
+    static       uint8_t kEmptyOut[1] = {0};
+    const uint8_t* ctPtr = cipher.empty() ? kEmptyIn  : cipher.data();
+    uint8_t*       ptPtr = hdr.payloadLen  ? plain.data() : kEmptyOut;
 
     CryptoResult res = decryptGCM(
         backupKey, hdr.nonce,
         (const uint8_t*)&hdr, aadLen,
-        cipher.data(), cipher.size(),
-        hdr.tag,
-        plain.data()
-    );
+        ctPtr, hdr.payloadLen,
+        hdr.tag, ptPtr);
     secureClear(backupKey, sizeof(backupKey));
 
     if (res != CryptoResult::OK) {
@@ -238,14 +283,16 @@ int backupImport(VaultState& vault) {
     }
 
     std::vector<VaultRecord> incoming;
-    bool ok = deserializeRecords(plain.data(), plain.size(), incoming);
+    bool ok = hdr.payloadLen
+              ? deserializeRecords(plain.data(), plain.size(), incoming)
+              : true;
     secureClear(plain.data(), plain.size());
     if (!ok) return -2;
 
-    // Merge: same UUID → keep record with newer lastChanged
+    if (outFound) *outFound = (int)incoming.size();
+
     int merged = 0;
-    for (size_t k = 0; k < incoming.size(); k++) {
-        VaultRecord& inc = incoming[k];
+    for (auto& inc : incoming) {
         bool found = false;
         for (auto& existing : vault.records) {
             if (memcmp(existing.uuid, inc.uuid, 16) == 0) {
@@ -267,9 +314,36 @@ int backupImport(VaultState& vault) {
             secureClear(inc.password.data(), inc.password.size());
         }
     }
-    incoming.clear();
 
     if (merged > 0) saveVault(vault);
-
     return merged;
+}
+
+// ============================================================
+// Read / delete
+// ============================================================
+
+size_t backupReadFile(const char* filename, uint8_t* buf, size_t maxLen) {
+    char path[BACKUP_FILENAME_MAX + 2];
+    if (filename[0] != '/') snprintf(path, sizeof(path), "/%s", filename);
+    else strncpy(path, filename, sizeof(path) - 1);
+
+    if (!dmzMount()) return 0;
+    File f = FFat.open(path, FILE_READ);
+    if (!f) { dmzUnmount(); return 0; }
+    size_t n = f.read(buf, maxLen);
+    f.close();
+    dmzUnmount();
+    return n;
+}
+
+bool backupDeleteFile(const char* filename) {
+    char path[BACKUP_FILENAME_MAX + 2];
+    if (filename[0] != '/') snprintf(path, sizeof(path), "/%s", filename);
+    else strncpy(path, filename, sizeof(path) - 1);
+
+    if (!dmzMount()) return false;
+    bool ok = FFat.remove(path);
+    dmzUnmount();
+    return ok;
 }
