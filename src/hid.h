@@ -28,3 +28,6 @@ void hidSetKeystrokeDelay(uint8_t ms);
 // sendEnter: append KEY_RETURN after the final character (default true).
 // Blocks until all keystrokes are sent or USB timeout is reached.
 HidResult typePassword(const char* pw, bool sendEnter = true);
+
+// Type a single character (e.g. '\t' for Tab) with the configured keystroke delay.
+HidResult hidTypeChar(char c);

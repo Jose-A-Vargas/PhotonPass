@@ -112,17 +112,66 @@ void backupChipId(char out[5]) {
 // Export
 // ============================================================
 
-bool backupExport(VaultState& vault, char* outName, size_t outNameLen) {
+bool backupExport(VaultState& vault, uint32_t dateTs, char* outName, size_t outNameLen) {
     if (!vault.unlocked) return false;
 
-    // Pick the filename first so it can be stored in the key record.
+    // Build YYYYMMDD string from dateTs (unix midnight); "00000000" if not set.
+    char dateStr[9];
+    if (dateTs == 0) {
+        strcpy(dateStr, "00000000");
+    } else {
+        uint32_t days = dateTs / 86400UL;
+        uint32_t y = 1970;
+        for (;;) {
+            bool leap = (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0));
+            uint32_t diy = leap ? 366 : 365;
+            if (days < diy) break;
+            days -= diy; y++;
+        }
+        static const uint8_t dim[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+        uint32_t m = 1, d = 1;
+        for (m = 1; m <= 12; m++) {
+            uint8_t dm = dim[m - 1];
+            if (m == 2 && (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0))) dm++;
+            if (days < dm) { d = days + 1; break; }
+            days -= dm;
+        }
+        snprintf(dateStr, sizeof(dateStr), "%04lu%02lu%02lu",
+                 (unsigned long)y, (unsigned long)m, (unsigned long)d);
+    }
+
+    // Pick the filename: scan DMZ for highest existing N for this chip+date.
     if (!dmzMount()) return false;
     char chipId[5]; backupChipId(chipId);
-    char path[BACKUP_FILENAME_MAX + 2];
-    for (int n = 1; n <= 9999; n++) {
-        snprintf(path, sizeof(path), "/%s%04d.BKP", chipId, n);
-        if (!FFat.exists(path)) break;
+
+    char prefix[20];
+    snprintf(prefix, sizeof(prefix), "%s-%s-", chipId, dateStr);
+    int prefLen = (int)strlen(prefix);
+    int maxN = 0;
+
+    File root = FFat.open("/");
+    if (root && root.isDirectory()) {
+        for (;;) {
+            File f = root.openNextFile();
+            if (!f) break;
+            if (!f.isDirectory()) {
+                const char* raw  = f.name();
+                const char* name = (raw[0] == '/') ? raw + 1 : raw;
+                int nameLen = (int)strlen(name);
+                if (nameLen > prefLen + 4 &&
+                    strncasecmp(name, prefix, prefLen) == 0 &&
+                    strcasecmp(name + nameLen - 4, ".bkp") == 0) {
+                    int n = atoi(name + prefLen);
+                    if (n > maxN) maxN = n;
+                }
+            }
+            f.close();
+        }
+        root.close();
     }
+
+    char path[BACKUP_FILENAME_MAX + 2];
+    snprintf(path, sizeof(path), "/%s-%s-%d.BKP", chipId, dateStr, maxN + 1);
     dmzUnmount();  // unmount before saveVault (which writes main LittleFS)
 
     // Always generate a fresh key for this file — never reuse.

@@ -41,6 +41,13 @@ static bool waitUsbReady() {
 // Public API
 // ============================================================
 
+HidResult hidTypeChar(char c) {
+    if (!waitUsbReady()) return HidResult::NOT_READY;
+    Keyboard.print(c);
+    if (_delayMs > 0) delay(_delayMs);
+    return HidResult::OK;
+}
+
 HidResult typePassword(const char* pw, bool sendEnter) {
     if (!pw || pw[0] == '\0') return HidResult::EMPTY_PW;
     if (!waitUsbReady())      return HidResult::NOT_READY;

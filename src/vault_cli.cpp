@@ -17,10 +17,12 @@
 //   rotate <n>             rotate password (saves old to history)
 //   type <n>               type password via HID keyboard (3 s countdown)
 //   typeu <n>              type username via HID keyboard (3 s countdown)
+//   typea <n>              username + Tab + password + Enter (3 s countdown)
 //   gen [len] [A|S|H|B]    generate a password without storing it
 //   backup                 export encrypted backup to DMZ FAT partition
 //   restore                import backup from DMZ into vault
 //   usbdrive               expose DMZ as USB drive for 60 s then disconnect
+//   date                   show/correct stored date (y / +days / YYYY-MM-DD)
 //   help / ?               show this menu
 
 #include <Arduino.h>
@@ -28,6 +30,7 @@
 #include <LittleFS.h>
 #include <USBMSC.h>
 #include <FFat.h>
+#include <Preferences.h>
 #include <stdarg.h>
 
 #include "config.h"
@@ -50,11 +53,14 @@
 //   0        boot sector (BPB)
 //   1–3      FAT1  (3 sectors covers up to 1023 FAT12 clusters)
 //   4–6      FAT2  (copy)
-//   7–8      root directory (2 sectors = 32 entries)
-//   9–1023   data clusters (file data)
+//   7–9      root directory (3 sectors = 48 entries — supports LFN)
+//   10–1023  data clusters (file data)
 #define FAT_SECTOR_SIZE     512
 #define FAT_IMAGE_SECTORS   1024          // 512 KB image in PSRAM
-#define FAT_DATA_START      9             // 1 + 2*3 + 2
+#define FAT_ROOT_SECTOR     7             // first root directory sector
+#define FAT_ROOT_SECTORS    3             // 3 sectors × 16 entries = 48 entries
+#define FAT_ROOT_ENTRIES    (FAT_ROOT_SECTORS * FAT_SECTOR_SIZE / 32)
+#define FAT_DATA_START      (FAT_ROOT_SECTOR + FAT_ROOT_SECTORS)  // = 10
 
 static USBMSC  sMSC;
 static uint8_t* sFatImage = nullptr;     // PSRAM FAT12 image, built on demand
@@ -77,83 +83,68 @@ static void fat12Set(uint8_t* fat, uint16_t cluster, uint16_t val) {
     }
 }
 
-// Build a FAT12 image in PSRAM containing a single file.
-// Returns true on success; caller must ps_free(sFatImage) after use.
-static bool buildFat12Image(const uint8_t* fileData, uint32_t fileSize) {
-    sFatImage = (uint8_t*)ps_malloc((size_t)FAT_IMAGE_SECTORS * FAT_SECTOR_SIZE);
-    if (!sFatImage) return false;
-    memset(sFatImage, 0, (size_t)FAT_IMAGE_SECTORS * FAT_SECTOR_SIZE);
-
-    // ---- Boot sector ----
-    uint8_t* b = sFatImage;
-    b[0]=0xEB; b[1]=0x3C; b[2]=0x90;          // JMP short + NOP
-    memcpy(b + 3, "PHOTONPS", 8);               // OEM name
-    fatW16(b+11, FAT_SECTOR_SIZE);              // bytes per sector
-    b[13] = 1;                                  // sectors per cluster
-    fatW16(b+14, 1);                            // reserved sectors
-    b[16] = 2;                                  // FAT copies
-    fatW16(b+17, 32);                           // root dir entries
-    fatW16(b+19, FAT_IMAGE_SECTORS);            // total sectors
-    b[21] = 0xF8;                               // media: fixed disk
-    fatW16(b+22, 3);                            // sectors per FAT
-    fatW16(b+24, 63);                           // sectors/track (cosmetic)
-    fatW16(b+26, 255);                          // heads (cosmetic)
-    fatW32(b+28, 0);                            // hidden sectors
-    b[36] = 0x00;                               // drive number
-    b[38] = 0x29;                               // ext boot sig
-    fatW32(b+39, 0x20260603);                   // volume serial
-    memcpy(b+43, "PHOTON PASS ", 11);           // volume label
-    memcpy(b+54, "FAT12   ", 8);               // FS type
-    b[510]=0x55; b[511]=0xAA;                   // signature
-
-    // ---- FAT1 (sector 1) ----
-    uint8_t* fat1 = sFatImage + FAT_SECTOR_SIZE;
-    fat1[0]=0xF8; fat1[1]=0xFF; fat1[2]=0xFF;  // media + reserved
-
-    uint32_t clusters = (fileSize + FAT_SECTOR_SIZE - 1) / FAT_SECTOR_SIZE;
-    for (uint32_t i = 0; i < clusters; i++) {
-        uint16_t next = (i == clusters - 1) ? 0xFFF : (uint16_t)(2 + i + 1);
-        fat12Set(fat1, (uint16_t)(2 + i), next);
-    }
-
-    // ---- FAT2 (sector 4) — copy ----
-    memcpy(sFatImage + 4 * FAT_SECTOR_SIZE, fat1, 3 * FAT_SECTOR_SIZE);
-
-    // ---- Root directory entry (sector 7) ----
-    uint8_t* dir = sFatImage + 7 * FAT_SECTOR_SIZE;
-    memcpy(dir, "BACKUP  BIN", 11);             // 8.3 name
-    dir[11] = 0x20;                             // archive attribute
-    fatW16(dir+22, 0x0000);                     // write time
-    fatW16(dir+24, 0x5CC3);                     // write date 2026-06-03
-    fatW16(dir+26, 2);                          // start cluster
-    fatW32(dir+28, fileSize);                   // file size
-
-    // ---- File data (sector 9+) ----
-    uint32_t maxData = (uint32_t)(FAT_IMAGE_SECTORS - FAT_DATA_START) * FAT_SECTOR_SIZE;
-    uint32_t copy = fileSize < maxData ? fileSize : maxData;
-    memcpy(sFatImage + FAT_DATA_START * FAT_SECTOR_SIZE, fileData, copy);
-
-    return true;
-}
-
-// ---- FAT12 multi-file entry ----
+// ---- FAT12 multi-file entry (supports LFN via nameLfn) ----
 
 struct FatEntry {
-    char     name83[12];    // 11-char 8.3 name (space-padded) + null
+    char     name83[12];    // synthetic 8.3 alias (space-padded, 11 chars + null)
+    char     nameLfn[32];   // full long filename for VFAT LFN entries
     const uint8_t* data;
     uint32_t size;
 };
 
-static void to83Name(const char* src, char out[12]) {
+// Synthetic 8.3 alias: "BKPnnnnn.BKP" (idx is 0-based)
+static void to83Name(int idx, char out[12]) {
     memset(out, ' ', 11); out[11] = '\0';
-    const char* dot = strchr(src, '.');
-    int nlen = dot ? (int)(dot - src) : (int)strlen(src);
-    if (nlen > 8) nlen = 8;
-    for (int i = 0; i < nlen; i++) out[i] = (char)toupper((unsigned char)src[i]);
-    if (dot) {
-        int elen = (int)strlen(dot + 1); if (elen > 3) elen = 3;
-        for (int i = 0; i < elen; i++) out[8+i] = (char)toupper((unsigned char)dot[1+i]);
+    char base[9];
+    snprintf(base, sizeof(base), "BKP%05d", idx + 1);
+    memcpy(out, base, 8);
+    out[8] = 'B'; out[9] = 'K'; out[10] = 'P';
+}
+
+// ---- VFAT LFN helpers ----
+
+// Byte offsets of the 13 UTF-16LE chars within a 32-byte LFN directory entry
+static const int kLfnCharOff[13] = {1,3,5,7,9, 14,16,18,20,22,24, 28,30};
+
+static uint8_t lfnChecksum(const char name83[11]) {
+    uint8_t s = 0;
+    for (int i = 0; i < 11; i++)
+        s = (uint8_t)(((s & 1) ? 0x80u : 0u) + (s >> 1) + (uint8_t)name83[i]);
+    return s;
+}
+
+// Write VFAT LFN entries into de[] for longName, using name83 for the checksum.
+// LFN entries are written highest-sequence-first (as required by VFAT spec).
+// Returns the number of 32-byte entries written (= ceil((len+13)/13) chunks).
+static int writeLfnEntries(uint8_t* de, const char* longName, const char name83[11]) {
+    int     len       = (int)strlen(longName);
+    int     numChunks = (len + 13) / 13;
+    uint8_t chk       = lfnChecksum(name83);
+
+    for (int chunk = numChunks - 1; chunk >= 0; chunk--) {
+        int     slot  = numChunks - 1 - chunk;   // directory slot (0 = first written)
+        uint8_t seq   = (uint8_t)(chunk + 1);    // 1-based
+        if (chunk == numChunks - 1) seq |= 0x40; // "last chunk" marker on highest seq
+
+        uint8_t* entry = de + slot * 32;
+        memset(entry, 0xFF, 32);
+        entry[0]  = seq;
+        entry[11] = 0x0F; // LFN attribute
+        entry[12] = 0;
+        entry[13] = chk;
+        entry[26] = 0; entry[27] = 0; // cluster must be 0
+
+        for (int ci = 0; ci < 13; ci++) {
+            int charIdx = chunk * 13 + ci;
+            uint16_t uc;
+            if      (charIdx <  len) uc = (uint8_t)longName[charIdx];
+            else if (charIdx == len) uc = 0x0000;
+            else                     uc = 0xFFFF;
+            entry[kLfnCharOff[ci]]     = (uint8_t)(uc & 0xFF);
+            entry[kLfnCharOff[ci] + 1] = (uint8_t)(uc >> 8);
+        }
     }
+    return numChunks;
 }
 
 static bool buildFat12Image(const FatEntry* files, int count) {
@@ -167,7 +158,7 @@ static bool buildFat12Image(const FatEntry* files, int count) {
     memcpy(b+3, "PHOTONPS", 8);
     fatW16(b+11, FAT_SECTOR_SIZE); b[13]=1;
     fatW16(b+14, 1); b[16]=2;
-    fatW16(b+17, 32); fatW16(b+19, FAT_IMAGE_SECTORS);
+    fatW16(b+17, FAT_ROOT_ENTRIES); fatW16(b+19, FAT_IMAGE_SECTORS);
     b[21]=0xF8; fatW16(b+22, 3);
     fatW16(b+24, 63); fatW16(b+26, 255);
     b[38]=0x29; fatW32(b+39, 0x20260603);
@@ -178,16 +169,20 @@ static bool buildFat12Image(const FatEntry* files, int count) {
     uint8_t* fat1 = sFatImage + FAT_SECTOR_SIZE;
     fat1[0]=0xF8; fat1[1]=0xFF; fat1[2]=0xFF;
 
-    // Root dir (sector 7, 2 sectors = 32 entries)
-    uint8_t* root = sFatImage + 7 * FAT_SECTOR_SIZE;
+    // Root dir
+    uint8_t* root = sFatImage + FAT_ROOT_SECTOR * FAT_SECTOR_SIZE;
 
     uint16_t nextCluster = 2;
     int      dirEntry    = 0;
 
-    for (int fi = 0; fi < count && dirEntry < 32; fi++) {
+    for (int fi = 0; fi < count; fi++) {
         if (!files[fi].data || files[fi].size == 0) continue;
 
-        uint32_t clusters    = (files[fi].size + FAT_SECTOR_SIZE - 1) / FAT_SECTOR_SIZE;
+        // Each file needs LFN entries + 1 8.3 entry; check capacity
+        int lfnNeeded = files[fi].nameLfn[0] ? (int)((strlen(files[fi].nameLfn) + 13) / 13) : 0;
+        if (dirEntry + lfnNeeded + 1 > FAT_ROOT_ENTRIES) break;
+
+        uint32_t clusters     = (files[fi].size + FAT_SECTOR_SIZE - 1) / FAT_SECTOR_SIZE;
         uint16_t startCluster = nextCluster;
 
         for (uint32_t i = 0; i < clusters; i++) {
@@ -196,6 +191,13 @@ static bool buildFat12Image(const FatEntry* files, int count) {
             nextCluster++;
         }
 
+        // Write LFN entries (if long name present)
+        if (lfnNeeded > 0) {
+            dirEntry += writeLfnEntries(root + dirEntry * 32,
+                                        files[fi].nameLfn, files[fi].name83);
+        }
+
+        // Write 8.3 directory entry
         uint8_t* de = root + dirEntry * 32;
         memcpy(de, files[fi].name83, 11);
         de[11] = 0x20;
@@ -265,30 +267,73 @@ static uint16_t fat12Get(const uint8_t* fat, uint16_t cluster) {
 
 // After a USB drive session, parse the PSRAM FAT12 image and write any .BKP
 // files that Windows copied onto the drive back to the DMZ FAT partition.
+// Supports VFAT LFN so long filenames survive the round-trip through Windows.
 static void syncPsramToFlash() {
     if (!sFatImage) return;
 
-    const uint8_t* fat  = sFatImage + 1 * FAT_SECTOR_SIZE;   // FAT1
-    const uint8_t* root = sFatImage + 7 * FAT_SECTOR_SIZE;   // root dir
+    const uint8_t* fat  = sFatImage + 1 * FAT_SECTOR_SIZE;
+    const uint8_t* root = sFatImage + FAT_ROOT_SECTOR * FAT_SECTOR_SIZE;
 
-    int imported = 0;
+    int  imported = 0;
+    char lfnBuf[256] = {};   // assembled LFN name; cleared between files
+    bool hasLfn = false;
 
-    for (int i = 0; i < 32; i++) {
+    for (int i = 0; i < FAT_ROOT_ENTRIES; i++) {
         const uint8_t* de = root + i * 32;
-        if (de[0] == 0x00) break;    // no more entries
-        if (de[0] == 0xE5) continue; // deleted
-        if (de[11] & 0x18) continue; // volume label or subdirectory
+        if (de[0] == 0x00) break;    // end of directory
 
-        // Check extension is BKP (bytes 8-10)
-        if (de[8] != 'B' || de[9] != 'K' || de[10] != 'P') continue;
+        if (de[0] == 0xE5) {         // deleted entry
+            memset(lfnBuf, 0, sizeof(lfnBuf)); hasLfn = false;
+            continue;
+        }
 
-        // Build "NAME    .EXT" → "NAME.BKP"
-        char fname[13];
-        int ni = 0;
-        for (int j = 0; j < 8 && de[j] != ' '; j++) fname[ni++] = (char)de[j];
-        fname[ni++] = '.';
-        fname[ni++] = 'B'; fname[ni++] = 'K'; fname[ni++] = 'P';
-        fname[ni]   = '\0';
+        uint8_t attr = de[11];
+
+        if (attr == 0x0F) {
+            // VFAT LFN entry — accumulate chars into lfnBuf by chunk position
+            uint8_t seq = de[0] & 0x3F;
+            if (seq == 0 || seq > 20) {
+                memset(lfnBuf, 0, sizeof(lfnBuf)); hasLfn = false;
+                continue;
+            }
+            int base = (seq - 1) * 13;
+            for (int ci = 0; ci < 13; ci++) {
+                int pos = base + ci;
+                if (pos >= (int)sizeof(lfnBuf) - 1) break;
+                uint16_t uc = de[kLfnCharOff[ci]] | ((uint16_t)de[kLfnCharOff[ci]+1] << 8);
+                if (uc == 0x0000 || uc == 0xFFFF) break;
+                lfnBuf[pos] = (char)(uc & 0x7F);
+            }
+            hasLfn = true;
+            continue;
+        }
+
+        if (attr & 0x18) {           // volume label or subdirectory
+            memset(lfnBuf, 0, sizeof(lfnBuf)); hasLfn = false;
+            continue;
+        }
+
+        // Regular file entry — resolve filename from LFN or 8.3
+        char fname[256];
+        if (hasLfn && lfnBuf[0] != '\0') {
+            strncpy(fname, lfnBuf, sizeof(fname) - 1);
+            fname[sizeof(fname) - 1] = '\0';
+        } else {
+            if (de[8] != 'B' || de[9] != 'K' || de[10] != 'P') {
+                memset(lfnBuf, 0, sizeof(lfnBuf)); hasLfn = false;
+                continue;
+            }
+            int ni = 0;
+            for (int j = 0; j < 8 && de[j] != ' '; j++) fname[ni++] = (char)de[j];
+            fname[ni++] = '.';
+            fname[ni++] = 'B'; fname[ni++] = 'K'; fname[ni++] = 'P';
+            fname[ni]   = '\0';
+        }
+        memset(lfnBuf, 0, sizeof(lfnBuf)); hasLfn = false;
+
+        // Must end in .BKP
+        size_t flen = strlen(fname);
+        if (flen < 5 || strcasecmp(fname + flen - 4, ".bkp") != 0) continue;
 
         // Skip files that existed before the session opened
         bool preExisting = false;
@@ -386,16 +431,127 @@ static void fmtDate(char* out, size_t len, uint32_t ts) {
     snprintf(out, len, "%04lu-%02lu-%02lu", (unsigned long)y, (unsigned long)m, (unsigned long)d);
 }
 
-// Read current time as a usable unix-ish timestamp.
-// No RTC on this board — offset from a fixed recent epoch so new records
-// sort after any pre-existing test records (which used ~1716000000).
+// Forward declaration — defined later in the Utilities section.
+static void promptLine(const char* prompt, char* buf, size_t maxlen, bool masked = false);
+
+// ============================================================
+// Date tracking (NVS — survives reboots, no RTC)
+// ============================================================
+
+static uint32_t sDateBase      = 0;   // unix midnight of last confirmed date
+static uint32_t sDateBaseMills = 0;   // millis() when sDateBase was set
+
+static void loadStoredDate() {
+    Preferences prefs;
+    prefs.begin("ppass", true);
+    sDateBase = prefs.getUInt("datebase", 0);
+    prefs.end();
+    sDateBaseMills = millis();
+}
+
+static void saveStoredDate(uint32_t midnight) {
+    Preferences prefs;
+    prefs.begin("ppass", false);
+    prefs.putUInt("datebase", midnight);
+    prefs.end();
+}
+
+// Calendar date → unix midnight (UTC)
+static uint32_t dateToUnix(uint16_t y, uint8_t m, uint8_t d) {
+    uint32_t days = 0;
+    for (uint16_t yr = 1970; yr < y; yr++) {
+        bool leap = (yr % 4 == 0 && (yr % 100 != 0 || yr % 400 == 0));
+        days += leap ? 366 : 365;
+    }
+    static const uint8_t dim[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+    for (uint8_t mo = 1; mo < m; mo++) {
+        uint8_t dm = dim[mo - 1];
+        if (mo == 2 && (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0))) dm++;
+        days += dm;
+    }
+    days += (uint32_t)(d - 1);
+    return days * 86400UL;
+}
+
+// Parse "YYYY-MM-DD" → unix midnight; returns 0 on failure
+static uint32_t parseDateStr(const char* s) {
+    if (strlen(s) != 10 || s[4] != '-' || s[7] != '-') return 0;
+    char tmp[11]; memcpy(tmp, s, 10); tmp[10] = '\0';
+    tmp[4] = '\0'; tmp[7] = '\0';
+    int y = atoi(tmp), m = atoi(tmp + 5), d = atoi(tmp + 8);
+    if (y < 2020 || y > 2099 || m < 1 || m > 12 || d < 1 || d > 31) return 0;
+    return dateToUnix((uint16_t)y, (uint8_t)m, (uint8_t)d);
+}
+
+// Prompt user to confirm or correct the stored date.
+// Called on every serial connect and also available as the 'date' command.
+static void cmdDateCheck() {
+    char dateBuf[16];
+
+    if (sDateBase == 0) {
+        Serial.print("  No date stored. Enter today's date [YYYY-MM-DD, Enter to skip]: ");
+        char input[16] = {};
+        promptLine("", input, sizeof(input));
+        if (input[0] == '\0') { Serial.println("  Date tracking disabled."); return; }
+        uint32_t ts = parseDateStr(input);
+        if (ts == 0) { Serial.println("  Invalid — skipping."); return; }
+        sDateBase      = ts;
+        sDateBaseMills = millis();
+        saveStoredDate(ts);
+        fmtDate(dateBuf, sizeof(dateBuf), ts);
+        Serial.printf("  Date set: %s\n", dateBuf);
+        return;
+    }
+
+    // Compute current date from elapsed time since last confirmation
+    uint32_t curTs       = sDateBase + (millis() - sDateBaseMills) / 1000;
+    uint32_t curMidnight = (curTs / 86400UL) * 86400UL;
+    fmtDate(dateBuf, sizeof(dateBuf), curTs);
+
+    Serial.printf("  Date: %s  [y / +days / YYYY-MM-DD]: ", dateBuf);
+    char input[16] = {};
+    promptLine("", input, sizeof(input));
+
+    const char* p = input;
+    while (*p == ' ') p++;
+
+    if (*p == '\0' || toupper((unsigned char)*p) == 'Y') {
+        sDateBaseMills = millis();   // re-anchor so elapsed drift resets
+        return;
+    }
+
+    uint32_t newMidnight = 0;
+    char* ep;
+    long offset = strtol(p, &ep, 10);
+    if (*ep == '\0' && offset >= 0) {
+        newMidnight = curMidnight + (uint32_t)offset * 86400UL;
+    } else {
+        newMidnight = parseDateStr(p);
+    }
+
+    if (newMidnight == 0) {
+        Serial.println("  Invalid — date unchanged.");
+        sDateBaseMills = millis();
+        return;
+    }
+
+    sDateBase      = newMidnight;
+    sDateBaseMills = millis();
+    saveStoredDate(newMidnight);
+    fmtDate(dateBuf, sizeof(dateBuf), newMidnight);
+    Serial.printf("  Date updated: %s\n", dateBuf);
+}
+
+// Current unix-ish timestamp.  Uses calibrated date if set, otherwise falls
+// back to a fixed epoch so records sort after old test data.
 static uint32_t now() {
-    return 1720000000UL + millis() / 1000;
+    if (sDateBase == 0) return 1720000000UL + millis() / 1000;
+    return sDateBase + (millis() - sDateBaseMills) / 1000;
 }
 
 // Blocking prompt — waits for a line. masked=true prints '*' for each char.
 // Accepts \r, \n, or \r\n as line terminator (works with PuTTY and Arduino IDE).
-static void promptLine(const char* prompt, char* buf, size_t maxlen, bool masked = false) {
+static void promptLine(const char* prompt, char* buf, size_t maxlen, bool masked) {
     Serial.print(prompt);
     size_t len = 0;
     char lastEnd = 0;
@@ -626,8 +782,9 @@ static void cmdShow(int n) {
     }
 
     Serial.println();
-    Serial.printf("  type %-3d — type password via HID\n", n);
-    Serial.printf("  typeu %-2d — type username via HID\n", n);
+    Serial.printf("  type  %-3d — type password via HID\n", n);
+    Serial.printf("  typeu %-3d — type username via HID\n", n);
+    Serial.printf("  typea %-3d — username + Tab + password + Enter\n", n);
     Serial.println();
 }
 
@@ -676,6 +833,30 @@ static void cmdTypeU(int n) {
         case HidResult::OK:        Serial.println("Sent!"); break;
         case HidResult::NOT_READY: Serial.println("\n  HID not ready — is USB HID enumerated?"); break;
         case HidResult::EMPTY_PW:  Serial.println("\n  Empty username."); break;
+    }
+}
+
+static void cmdTypeA(int n) {
+    if (!gVault.unlocked) { Serial.println("  Vault is locked."); return; }
+    if (n < 1 || n > (int)gVault.records.size()) {
+        Serial.printf("  No record #%d.\n", n); return;
+    }
+    auto& r = gVault.records[n - 1];
+
+    hidCountdown("username+Tab+password+Enter", r.domain.c_str());
+
+    HidResult hr = HidResult::OK;
+    if (!r.username.empty())
+        hr = typePassword(r.username.c_str(), false);
+    if (hr == HidResult::OK)
+        hr = hidTypeChar('\t');
+    if (hr == HidResult::OK && !r.password.empty())
+        hr = typePassword(r.password.c_str(), true);
+
+    switch (hr) {
+        case HidResult::OK:        Serial.println("Sent!"); break;
+        case HidResult::NOT_READY: Serial.println("\n  HID not ready — is USB HID enumerated?"); break;
+        case HidResult::EMPTY_PW:  Serial.println("\n  Empty field."); break;
     }
 }
 
@@ -807,7 +988,7 @@ static void cmdBackup() {
 
     char filename[BACKUP_FILENAME_MAX] = {};
     Serial.println("  Exporting encrypted backup to DMZ...");
-    if (!backupExport(gVault, filename, sizeof(filename))) {
+    if (!backupExport(gVault, sDateBase, filename, sizeof(filename))) {
         Serial.println("  Backup failed."); return;
     }
 
@@ -957,43 +1138,50 @@ static void cmdDelBkp() {
 }
 
 static void cmdUsbDrive() {
-    if (!gVault.unlocked) { Serial.println("  Vault is locked."); return; }
+    // No vault lock check — drive must be usable to restore a backup to a new chip.
 
-    // Enumerate existing .BKP files — run 'backup' first if you want a fresh one
+    // Enumerate existing .BKP files on DMZ
     gBkpCount = 0;
     backupListFiles(bkpListCb);
-    if (gBkpCount == 0) { Serial.println("  No files to expose."); return; }
 
-    // Read each file into PSRAM, build multi-file FAT12 image
-    Serial.printf("  Building FAT12 image with %d file(s)...\n", gBkpCount);
+    bool imageOk = false;
 
-    uint32_t maxPerFile = (uint32_t)(FAT_IMAGE_SECTORS - FAT_DATA_START)
-                          * FAT_SECTOR_SIZE / (uint32_t)gBkpCount;
+    if (gBkpCount == 0) {
+        Serial.println("  No backups on DMZ — exposing empty drive.");
+        Serial.println("  Copy a .BKP file onto the drive, then disconnect to import it.");
+        imageOk = buildFat12Image(nullptr, 0);
+    } else {
+        Serial.printf("  Building FAT12 image with %d file(s)...\n", gBkpCount);
 
-    FatEntry* entries = (FatEntry*)malloc(sizeof(FatEntry) * gBkpCount);
-    if (!entries) { Serial.println("  Allocation failed."); return; }
+        uint32_t maxPerFile = (uint32_t)(FAT_IMAGE_SECTORS - FAT_DATA_START)
+                              * FAT_SECTOR_SIZE / (uint32_t)gBkpCount;
 
-    bool ok = true;
-    for (int i = 0; i < gBkpCount && ok; i++) {
-        uint8_t* buf = (uint8_t*)ps_malloc(maxPerFile);
-        if (!buf) { ok = false; break; }
-        size_t n = backupReadFile(gBkpList[i], buf, maxPerFile);
-        if (n == 0) { free(buf); ok = false; break; }
-        to83Name(gBkpList[i], entries[i].name83);
-        entries[i].data = buf;
-        entries[i].size = (uint32_t)n;
-    }
+        FatEntry* entries = (FatEntry*)malloc(sizeof(FatEntry) * gBkpCount);
+        if (!entries) { Serial.println("  Allocation failed."); return; }
 
-    if (!ok || !buildFat12Image(entries, gBkpCount)) {
+        bool ok = true;
+        for (int i = 0; i < gBkpCount && ok; i++) {
+            uint8_t* buf = (uint8_t*)ps_malloc(maxPerFile);
+            if (!buf) { ok = false; break; }
+            size_t n = backupReadFile(gBkpList[i], buf, maxPerFile);
+            if (n == 0) { free(buf); ok = false; break; }
+            to83Name(i, entries[i].name83);
+            strncpy(entries[i].nameLfn, gBkpList[i], sizeof(entries[i].nameLfn) - 1);
+            entries[i].nameLfn[sizeof(entries[i].nameLfn) - 1] = '\0';
+            entries[i].data = buf;
+            entries[i].size = (uint32_t)n;
+        }
+
+        imageOk = ok && buildFat12Image(entries, gBkpCount);
         for (int i = 0; i < gBkpCount; i++) if (entries[i].data) free((void*)entries[i].data);
         free(entries);
-        Serial.println("  Failed to build image."); return;
     }
-    for (int i = 0; i < gBkpCount; i++) if (entries[i].data) free((void*)entries[i].data);
-    free(entries);
+
+    if (!imageOk) { Serial.println("  Failed to build image."); return; }
 
     sMSC.mediaPresent(true);
-    Serial.println("  USB drive active — copy .BKP files to your PC.");
+    if (gBkpCount > 0)
+        Serial.println("  USB drive active — copy .BKP files to your PC.");
     Serial.println("  Drive disconnects in 60 seconds (or press any key).");
 
     uint32_t deadline = millis() + 60000;
@@ -1043,17 +1231,19 @@ static void printHelp() {
     Serial.println("    del <n>               delete record");
     Serial.println("    rotate <n>            rotate password, save old to history");
     Serial.println();
-    Serial.println("  HID Output  (3 s countdown, no Enter appended)");
-    Serial.println("    type  <n>             type password");
-    Serial.println("    typeu <n>             type username");
+    Serial.println("  HID Output  (3 s countdown)");
+    Serial.println("    type  <n>             type password (no Enter)");
+    Serial.println("    typeu <n>             type username (no Enter)");
+    Serial.println("    typea <n>             username + Tab + password + Enter");
     Serial.println();
     Serial.println("  Backup");
     Serial.println("    backup                export encrypted backup to DMZ (unique key each time)");
     Serial.println("    restore               merge a DMZ backup into vault, delete after");
     Serial.println("    delbkp               delete a backup file + its key from vault");
-    Serial.println("    usbdrive              expose DMZ as USB drive for 60 s");
+    Serial.println("    usbdrive              expose DMZ as USB drive for 60 s (no unlock needed)");
     Serial.println();
     Serial.println("  Utility");
+    Serial.println("    date                  show/set date (y / +days / YYYY-MM-DD)");
     Serial.println("    gen [len] [A|S|H|B]   generate password (default: 20 S)");
     Serial.println("    help / ?              this menu");
     Serial.println();
@@ -1077,7 +1267,8 @@ static void processLine(const char* line) {
     char* arg2 = strtok(nullptr, " \t");
     char* ep;
 
-    if      (strcasecmp(tok, "init")   == 0) cmdInit();
+    if      (strcasecmp(tok, "date")   == 0) cmdDateCheck();
+    else if (strcasecmp(tok, "init")   == 0) cmdInit();
     else if (strcasecmp(tok, "unlock") == 0) cmdUnlock();
     else if (strcasecmp(tok, "lock")   == 0) cmdLock();
     else if (strcasecmp(tok, "save")   == 0) cmdSave();
@@ -1106,6 +1297,10 @@ static void processLine(const char* line) {
     else if (strcasecmp(tok, "typeu")  == 0) {
         if (!arg1) Serial.println("  Usage: typeu <n>");
         else cmdTypeU((int)strtol(arg1, &ep, 10));
+    }
+    else if (strcasecmp(tok, "typea")  == 0) {
+        if (!arg1) Serial.println("  Usage: typea <n>");
+        else cmdTypeA((int)strtol(arg1, &ep, 10));
     }
     else if (strcasecmp(tok, "backup")   == 0) cmdBackup();
     else if (strcasecmp(tok, "restore")  == 0) cmdRestore();
@@ -1179,7 +1374,7 @@ static void printWelcome() {
         Serial.print("Vault found. Type 'unlock' to unlock.\r\n");
     else
         Serial.print("No vault found. Type 'init' to create one.\r\n");
-    Serial.print("Type 'help' for commands.\r\n\r\n> ");
+    Serial.print("Type 'help' for commands.\r\n");
 }
 
 void setup() {
@@ -1202,6 +1397,8 @@ void setup() {
 
     if (!LittleFS.begin(true))
         while (true) delay(1000);  // LittleFS fatal — hang
+
+    loadStoredDate();
 }
 
 void loop() {
@@ -1209,8 +1406,10 @@ void loop() {
     bool conn = (bool)Serial;
 
     if (conn && !sPrevConn) {
-        delay(150);      // let the terminal finish connecting before sending
+        delay(150);
         printWelcome();
+        cmdDateCheck();
+        Serial.print("\r\n> ");
     }
     sPrevConn = conn;
 
