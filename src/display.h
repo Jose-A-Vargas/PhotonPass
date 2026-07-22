@@ -1,19 +1,28 @@
 #pragma once
 #include <stdint.h>
 
-// ============================================================
-// Hardware: Goodisplay GDEY042T81-T02
-//   Panel  : 400 x 300 px, BW, SPI
-//   Touch  : GT911 capacitive controller, I2C (addr 0x5D)
-//
-// Display regions used by this driver:
-//   y=0..74   — input area  (prompt + typed text)
-//   y=75..79  — separator bar
-//   y=80..281 — keyboard    (4 rows × 46 px + 3 × 6 px gaps)
-// ============================================================
+#ifdef BOARD_EPD47_S3
+// LilyGo T5 4.7" S3 v2.4
+//   Panel  : 960 × 540, ED047TC1, parallel bus (epdiy)
+//   Touch  : GT911, I2C 0x5D
+//   Regions:
+//     y=0..109   input area (prompt + text box)
+//     y=110..116 separator
+//     y=120..514 keyboard (4 rows × 95 px, 5 px gaps)
+#  define DISPLAY_WIDTH   960
+#  define DISPLAY_HEIGHT  540
+#else
+// Goodisplay GDEY042T81-T02
+//   Panel  : 400 × 300, BW, SPI (GxEPD2)
+//   Touch  : GT911, I2C 0x5D
+//   Regions:
+//     y=0..74   input area
+//     y=75..79  separator
+//     y=80..281 keyboard (4 rows × 46 px)
+#  define DISPLAY_WIDTH   400
+#  define DISPLAY_HEIGHT  300
+#endif
 
-#define DISPLAY_WIDTH    400
-#define DISPLAY_HEIGHT   300
 #define QR_MAX_VERSION   10   // ECC_LOW v10 → max ~134 chars
 
 struct TouchPoint {
@@ -71,10 +80,14 @@ private:
                    const char* label, bool inverted = false);
     char _hitTestKey(uint16_t tx, uint16_t ty, uint8_t mode) const;
 
+#ifndef BOARD_EPD47_S3
+    // Raw GT911 register access — XIAO variant only.
+    // EPD47 variant uses file-scope static helpers instead.
     bool _gt911Read(uint16_t& x, uint16_t& y);
     bool _gt911Pressed();
     void _gt911WriteReg(uint16_t reg, uint8_t val);
     void _gt911ReadReg(uint16_t reg, uint8_t* buf, uint8_t len);
+#endif
 };
 
 extern Display display;

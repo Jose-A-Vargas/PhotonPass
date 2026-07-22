@@ -1,5 +1,16 @@
 #pragma once
 
+#ifdef BOARD_EPD47_S3
+// ============================================================
+// Hardware Pins — LilyGo T5 4.7" S3 v2.4  (T5_47_PLUS)
+// EPD parallel bus managed internally by LilyGo epdiy fork.
+// Touch I2C pins confirmed from examples/touchtest/pins.h.
+// ============================================================
+#define PIN_TOUCH_SDA       18
+#define PIN_TOUCH_SCL       17
+#define PIN_TOUCH_INT       47   // not used in polling mode, here for reference
+
+#else
 // ============================================================
 // Hardware Pins — XIAO ESP32S3 Plus
 // SPI: SCK=D8, MOSI=D10  (MISO unused — E-Ink is write-only)
@@ -16,6 +27,7 @@
 #define PIN_TOUCH_SDA       D4
 #define PIN_TOUCH_SCL       D5
 #define PIN_TOUCH_INT       D9  // repurposed MISO — safe since E-Ink is write-only
+#endif
 
 #define PIN_SCANNER_TX      D6
 #define PIN_SCANNER_RX      D7
