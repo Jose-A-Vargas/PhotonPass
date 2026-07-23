@@ -66,6 +66,9 @@ public:
     // Non-blocking single-point poll.
     TouchPoint readTouch();
 
+    // Block until no finger is detected, then return.
+    void waitRelease();
+
     // ---- Soft keyboard ----
 
     // Blocking: draws QWERTY/numeric keyboard, accumulates keypresses into buf.
