@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(git mv *)"
+      "Bash(git mv *)",
+      "Bash(xargs grep -li \"mono\\\\|courier\\\\|inconsolata\\\\|jetbrains\\\\|fira.*mono\\\\|hack\\\\|ubuntu.*mono\")",
+      "Bash(xargs cat)"
     ]
   }
 }
