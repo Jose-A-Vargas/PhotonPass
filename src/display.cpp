@@ -20,7 +20,8 @@
 #define T5_47_PLUS  // selects S3 pins in any LilyGo board-helper headers
 
 #include "epd_driver.h"
-#include "firasans.h"        // extern const GFXfont FiraSans  (in library src/)
+#include "ed047tc1.h"        // epd_start_frame / epd_output_row / epd_skip / epd_switch_buffer
+#include "mono.h"            // extern const GFXfont MonoFont  (generated from consola.ttf)
 #include <qrcode.h>
 
 static inline void secureClear(void* p, size_t n) { memset(p, 0, n); }
@@ -46,9 +47,9 @@ static void dispLog(const char* fmt, ...) {
 #define GT911_REG_STATUS  0x814E
 #define GT911_REG_POINT1  0x8150
 
-static uint8_t* _fb = nullptr;
+static uint8_t* _fb        = nullptr;
+static int      _charWidth = 0;   // advance width of one glyph (monospaced — all chars equal)
 
-// Tracks what showMessage last rendered so we can compute the union erase rect.
 static char _prevTitle[128] = {};
 static char _prevBody[128]  = {};
 
@@ -164,12 +165,67 @@ static void _fbFillWhite(int x, int y, int w, int h) {
 }
 
 // ============================================================
-// Text helpers — single font (FiraSans), cursor = baseline
+// Direct Update (DU) — per-pixel selective waveform
+// ============================================================
+
+// Build one row of 2bpp drive data from the 4bpp framebuffer.
+//   0b10 = drive white  (nibble >= 8 in fb)
+//   0b01 = drive black  (nibble <  8 in fb)
+//   0b00 = zero voltage (column outside `area` — panel pixel untouched)
+static void _buildDuRow(uint8_t *out, const uint8_t *fb, int y, Rect_t area) {
+    memset(out, 0, EPD_WIDTH / 4);
+    const uint8_t *row = fb + y * (EPD_WIDTH / 2);
+    for (int x = area.x; x < area.x + area.width; x++) {
+        uint8_t nibble = (x & 1) ? (row[x >> 1] >> 4) : (row[x >> 1] & 0xF);
+        uint8_t drive  = (nibble >= 8) ? 0b10 : 0b01;
+        out[x >> 2]   |= drive << (2 * (x & 3));
+    }
+    // No reorder: natural byte order matches what the ESP32-S3 I2S expects.
+    // reorder_line_buffer() in epd_push_pixels only works unnoticed because
+    // epd_clear_area_cycles always passes uniform data (0xAA/0x55 in every byte),
+    // for which swapping 16-bit halves is a no-op.
+}
+
+// Drive `area` pixels to match `fb` content in `passes` full frame scans.
+// Pixels outside `area` receive zero voltage — they are never touched.
+// Two passes is enough for fresh B/W transitions; increase if ghosting persists.
+static void _duUpdate(Rect_t area, const uint8_t *fb, int time_dus, int passes) {
+    uint8_t row_buf[EPD_WIDTH / 4];
+    for (int p = 0; p < passes; p++) {
+        epd_start_frame();
+        bool started = false;
+        for (int y = 0; y < EPD_HEIGHT; y++) {
+            if (y < area.y || y >= area.y + area.height) {
+                epd_skip();
+                continue;
+            }
+            _buildDuRow(row_buf, fb, y, area);
+            if (!started) {
+                // Prime both I2S buffers with the first row so the pipeline
+                // starts cleanly regardless of previous buffer state.
+                epd_switch_buffer();
+                memcpy(epd_get_current_buffer(), row_buf, EPD_WIDTH / 4);
+                epd_switch_buffer();
+                memcpy(epd_get_current_buffer(), row_buf, EPD_WIDTH / 4);
+                started = true;
+            } else {
+                // Other buffer is idle (DMA runs on its pair) — safe to write.
+                memcpy(epd_get_current_buffer(), row_buf, EPD_WIDTH / 4);
+            }
+            epd_output_row(time_dus);
+        }
+        epd_output_row(time_dus);  // flush last row through the latch pipeline
+        epd_end_frame();
+    }
+}
+
+// ============================================================
+// Text helpers — single font (MonoFont), cursor = baseline
 // ============================================================
 
 static int _textWidth(const char* text) {
     int32_t x1, y1, tw, th, cx = 0, cy = 0;
-    get_text_bounds((GFXfont*)&FiraSans, text,
+    get_text_bounds((GFXfont*)&MonoFont, text,
                     &cx, &cy, &x1, &y1, &tw, &th, NULL);
     return (int)tw;
 }
@@ -180,7 +236,7 @@ static void _drawStr(int32_t cx, int32_t cy, const char* text) {
     props.bg_color       = 15;   // white
     props.fallback_glyph = '?';  // substitute for chars not in font
     props.flags          = 0;
-    write_mode((GFXfont*)&FiraSans, text, &cx, &cy, _fb, BLACK_ON_WHITE, &props);
+    write_mode((GFXfont*)&MonoFont, text, &cx, &cy, _fb, BLACK_ON_WHITE, &props);
 }
 
 // ============================================================
@@ -197,8 +253,9 @@ bool Display::begin() {
     }
     _fbClear();
 
-    Serial.printf("[EPD47] FiraSans line_height=%d ascender=%d\n",
-                  FiraSans.advance_y, FiraSans.ascender);
+    _charWidth = _textWidth("M");
+    Serial.printf("[EPD47] MonoFont line_height=%d ascender=%d charWidth=%d\n",
+                  MonoFont.advance_y, MonoFont.ascender, _charWidth);
 
     _gt911Init();
 
@@ -221,7 +278,7 @@ void Display::drawText(uint16_t x, uint16_t y, const char* text) {
 }
 
 void Display::drawTextLarge(uint16_t x, uint16_t y, const char* text) {
-    _drawStr((int32_t)x, (int32_t)y, text);  // one font size in FiraSans
+    _drawStr((int32_t)x, (int32_t)y, text);  // one font size in MonoFont
 }
 
 void Display::drawTextCentered(uint16_t y, const char* text) {
@@ -229,7 +286,7 @@ void Display::drawTextCentered(uint16_t y, const char* text) {
     int32_t cx = (DISPLAY_WIDTH - w) / 2;
     if (cx < 0) cx = 0;
     int32_t cy = (int32_t)y;
-    writeln((GFXfont*)&FiraSans, text, &cx, &cy, _fb);
+    writeln((GFXfont*)&MonoFont, text, &cx, &cy, _fb);
 }
 
 void Display::drawRect(uint16_t x, uint16_t y, uint16_t w, uint16_t h) {
@@ -282,100 +339,67 @@ static uint8_t* _compactFromFb(int x, int y, int w, int h) {
     return buf;
 }
 
-// Push a rect from _fb to the panel.
-// epd_clear_area_cycles with higher cycle count drives pixels to true white
-// before the draw, avoiding grey residue and edge artefacts.
 static void _pushRect(int x, int y, int w, int h) {
     uint8_t* compact = _compactFromFb(x, y, w, h);
     if (!compact) return;
     Rect_t r = {x, y, w, h};
-    epd_clear_area_cycles(r, 5, 50);
+    epd_clear_area_cycles(r, 3, 50);
     epd_draw_grayscale_image(r, compact);
     free(compact);
 }
 
-// Update one text line with surgical precision:
-//   - Identical string  → skip entirely (no panel operation)
-//   - Stable centering  → update only the changed-character pixel range
-//   - Centering shifted → update union of old and new bounding boxes
 static void _renderLine(const char* oldStr, const char* newStr,
                         int32_t baselineY, int above, int below) {
     bool oldEmpty = !oldStr || !*oldStr;
     bool newEmpty = !newStr || !*newStr;
+    if (oldEmpty && newEmpty) return;
+    if (!oldEmpty && !newEmpty && strcmp(oldStr, newStr) == 0) return;
 
-    dispLog("renderLine old='%s' new='%s'",
-            oldEmpty ? "(empty)" : oldStr,
-            newEmpty ? "(empty)" : newStr);
+    int oldLen = oldEmpty ? 0 : (int)strlen(oldStr);
+    int newLen = newEmpty ? 0 : (int)strlen(newStr);
+    int oldW   = oldLen * _charWidth;
+    int newW   = newLen * _charWidth;
+    int oldX   = oldEmpty ? 0 : (DISPLAY_WIDTH - oldW) / 2;
+    int newX   = newEmpty ? 0 : (DISPLAY_WIDTH - newW) / 2;
+    int uY     = (int)baselineY - above;
+    int uH     = above + below;
 
-    if (oldEmpty && newEmpty) { dispLog("  -> both empty, skip"); return; }
-    if (!oldEmpty && !newEmpty && strcmp(oldStr, newStr) == 0) {
-        dispLog("  -> identical, skip");
-        return;
-    }
-
-    int oldW = oldEmpty ? 0 : _textWidth(oldStr);
-    int newW = newEmpty ? 0 : _textWidth(newStr);
-    int oldX = (DISPLAY_WIDTH - oldW) / 2;
-    int newX = (DISPLAY_WIDTH - newW) / 2;
-    int uY   = (int)baselineY - above;
-    int uH   = above + below;
-
-    dispLog("  oldW=%d oldX=%d  newW=%d newX=%d  shift=%d",
-            oldW, oldX, newW, newX, oldX - newX);
-
-    int dirtyL, dirtyR;
-
-    if (abs(oldX - newX) <= 8) {
-        int oldLen = oldEmpty ? 0 : (int)strlen(oldStr);
-        int newLen = newEmpty ? 0 : (int)strlen(newStr);
-
+    // Clear changed columns in framebuffer, then draw the full new string.
+    int clearL, clearW;
+    if (!oldEmpty && !newEmpty && oldLen == newLen) {
         int pre = 0;
-        while (pre < oldLen && pre < newLen && oldStr[pre] == newStr[pre]) pre++;
+        while (pre < oldLen && oldStr[pre] == newStr[pre]) pre++;
         int suf = 0;
-        while (suf < (oldLen - pre) && suf < (newLen - pre) &&
-               oldStr[oldLen - 1 - suf] == newStr[newLen - 1 - suf]) suf++;
-
-        const char* src    = newEmpty ? oldStr : newStr;
-        int         srcLen = newEmpty ? oldLen  : newLen;
-
-        char buf[128] = {};
-        int prefixPx = 0;
-        if (pre > 0 && pre < (int)sizeof(buf)) {
-            memcpy(buf, src, pre);
-            prefixPx = _textWidth(buf);
-        }
-        int suffixPx = 0;
-        if (suf > 0 && suf < (int)sizeof(buf)) {
-            strncpy(buf, src + srcLen - suf, sizeof(buf) - 1);
-            suffixPx = _textWidth(buf);
-        }
-
-        int baseX = (oldX + newX) / 2;
-        dirtyL = baseX + prefixPx;
-        dirtyR = baseX + max(oldW, newW) - suffixPx;
-
-        dispLog("  stable: pre=%d(%dpx) suf=%d(%dpx) raw dirty=[%d,%d]",
-                pre, prefixPx, suf, suffixPx, dirtyL, dirtyR);
+        while (suf < oldLen - pre && oldStr[oldLen-1-suf] == newStr[newLen-1-suf]) suf++;
+        clearL = newX + pre * _charWidth;
+        clearW = (newLen - pre - suf) * _charWidth;
     } else {
-        dirtyL = min(oldX, newX);
-        dirtyR = max(oldX + oldW, newX + newW);
-        dispLog("  shifted: raw dirty=[%d,%d]", dirtyL, dirtyR);
+        int uL = oldEmpty ? newX          : (newEmpty ? oldX          : min(oldX, newX));
+        int uR = oldEmpty ? (newX + newW) : (newEmpty ? (oldX + oldW) : max(oldX + oldW, newX + newW));
+        clearL = uL;
+        clearW = uR - uL;
     }
+    if (clearW > 0)
+        epd_fill_rect(clearL, uY, clearW, uH, EPD47_WHITE, _fb);
+    if (!newEmpty)
+        _drawStr(newX, baselineY, newStr);
 
-    dirtyL = max(0,         (dirtyL - 16) & ~7);
-    dirtyR = min(EPD_WIDTH, (dirtyR + 23) & ~7);
-    int dirtyW = dirtyR - dirtyL;
-    dispLog("  aligned dirty=[%d,%d] w=%d", dirtyL, dirtyR, dirtyW);
-    if (dirtyW <= 0) { dispLog("  -> zero width, skip"); return; }
+    // DU drive on the text union: each pixel gets voltage matching _fb.
+    // Zero voltage outside the rect — no bleed, no adjacent pixels touched.
+    int pushL = max(0,         oldEmpty ? newX          : (newEmpty ? oldX          : min(oldX, newX)));
+    int pushR = min(EPD_WIDTH, oldEmpty ? (newX + newW) : (newEmpty ? (oldX + oldW) : max(oldX + oldW, newX + newW)));
 
-    _fbFillWhite(dirtyL, uY, dirtyW, uH);
-    if (!newEmpty) _drawStr(newX, baselineY, newStr);
+    dispLog("renderLine old='%s' new='%s' du=[%d,%d]",
+            oldEmpty ? "" : oldStr, newEmpty ? "" : newStr, pushL, pushR);
 
-    _pushRect(dirtyL, uY, dirtyW, uH);
+    if (pushR > pushL) {
+        Rect_t r = {pushL, uY, pushR - pushL, uH};
+        _duUpdate(r, _fb, 300, 3);
+    }
 }
 
 void Display::showMessage(const char* title, const char* body) {
-    // FiraSans: ascender=39, descender=11.  Two lines centred, 70px apart.
+    // MonoFont: ascender=39, descender=11.  Two lines centred, 70px apart.
     static const int32_t kTitleY = 235;
     static const int32_t kBodyY  = 305;
     static const int kAbove = 44, kBelow = 16;
@@ -555,10 +579,10 @@ void Display::_labelKey(uint16_t kx, uint16_t ky, uint16_t kw, uint16_t kh,
         props.bg_color     = 0;
         props.fallback_glyph = 0;
         props.flags        = DRAW_BACKGROUND;
-        write_mode((GFXfont*)&FiraSans, label, &lx, &ly, _fb,
+        write_mode((GFXfont*)&MonoFont, label, &lx, &ly, _fb,
                    WHITE_ON_BLACK, &props);
     } else {
-        writeln((GFXfont*)&FiraSans, label, &lx, &ly, _fb);
+        writeln((GFXfont*)&MonoFont, label, &lx, &ly, _fb);
     }
 }
 
