@@ -1,29 +1,27 @@
 #include <Arduino.h>
-#include <Wire.h>
 #include "display.h"
-
-static uint32_t gCount = 0;
 
 void setup() {
     Serial.begin(115200);
     delay(500);
     display.begin();
-    display.showMessage("PhotonPass", "Touch to test");
-    Serial.println("v3 — touch test with counter");
 }
 
 void loop() {
-    TouchPoint tp = display.readTouch();
-    if (!tp.pressed) { delay(20); return; }
+    char buf[128] = {};
 
-    display.waitRelease();
+    display.keyboard(buf, sizeof(buf), "Search:", Display::KeyboardMode::QWERTY);
+    Serial.printf("[KB] got: '%s'\n", buf);
+    display.showMessage("Got:", buf);
+    delay(2000);
 
-    gCount++;
-    char buf[24];
-    snprintf(buf, sizeof(buf), "x%u y%u  #%lu", tp.x, tp.y, gCount);
-    Serial.println(buf);
+    display.keyboard(buf, sizeof(buf), "No space:", Display::KeyboardMode::QWERTY_NO_SPACE);
+    Serial.printf("[KB] got: '%s'\n", buf);
+    display.showMessage("Got:", buf);
+    delay(2000);
 
-    char line2[16];
-    snprintf(line2, sizeof(line2), "tap %lu", gCount);
-    display.showMessage("Touch", line2);
+    display.keyboard(buf, sizeof(buf), "PIN:", Display::KeyboardMode::NUMPAD);
+    Serial.printf("[KB] got: '%s'\n", buf);
+    display.showMessage("PIN:", buf);
+    delay(2000);
 }

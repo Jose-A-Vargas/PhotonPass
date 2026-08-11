@@ -69,12 +69,22 @@ public:
     // Block until no finger is detected, then return.
     void waitRelease();
 
-    // ---- Soft keyboard ----
+    // ---- Soft keyboard (legacy XIAO variant) ----
 
-    // Blocking: draws QWERTY/numeric keyboard, accumulates keypresses into buf.
-    // Confirm with Enter key. buf is always null-terminated on return.
-    // Returns true on Enter, false if called with invalid args.
     bool softKeyboard(char* buf, uint8_t maxLen, const char* prompt);
+
+    // ---- Keyboard widget (EPD47 variant) ----
+
+    enum class KeyboardMode : uint8_t {
+        QWERTY,           // number row + QWERTY + spacebar + OK
+        QWERTY_NO_SPACE,  // number row + QWERTY + OK (no space)
+        NUMPAD,           // 7-9/ 4-6* 1-3- .0DEL+ + OK
+    };
+
+    // Blocking keyboard entry. Rotation state persists between calls.
+    // Returns true on OK/Enter, false on invalid args.
+    bool keyboard(char* buf, uint8_t maxLen, const char* prompt,
+                  KeyboardMode mode = KeyboardMode::QWERTY_NO_SPACE);
 
 private:
     void _drawInputArea(const char* input, const char* prompt);
@@ -82,6 +92,9 @@ private:
     void _labelKey(uint16_t kx, uint16_t ky, uint16_t kw, uint16_t kh,
                    const char* label, bool inverted = false);
     char _hitTestKey(uint16_t tx, uint16_t ty, uint8_t mode) const;
+
+    void _kb2DrawAll(KeyboardMode mode, bool shifted, const char* buf);
+    char _kb2HitTest(uint16_t tx, uint16_t ty, KeyboardMode mode, bool shifted) const;
 
 #ifndef BOARD_EPD47_S3
     // Raw GT911 register access — XIAO variant only.

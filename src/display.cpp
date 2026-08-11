@@ -187,34 +187,92 @@ static void _buildDuRow(uint8_t *out, const uint8_t *fb, int y, Rect_t area) {
 }
 
 // Drive `area` pixels to match `fb` content in `passes` full frame scans.
-// Pixels outside `area` receive zero voltage — they are never touched.
-// Two passes is enough for fresh B/W transitions; increase if ghosting persists.
-static void _duUpdate(Rect_t area, const uint8_t *fb, int time_dus, int passes) {
+// `pre_clears` full-white passes run first to dissolve ghosting before the DU.
+// Pixels outside `area` receive zero voltage in all passes — never touched.
+static void _duUpdate(Rect_t area, const uint8_t *fb, int time_dus, int pre_clears, int passes) {
     uint8_t row_buf[EPD_WIDTH / 4];
+
+    // Pre-clear: drive every pixel in the rect white. Row data is uniform so
+    // build it once and reuse for all rows (same as epd_push_pixels does).
+    if (pre_clears > 0) {
+        memset(row_buf, 0, EPD_WIDTH / 4);
+        for (int x = area.x; x < area.x + area.width; x++)
+            row_buf[x >> 2] |= 0b10 << (2 * (x & 3));
+
+        for (int p = 0; p < pre_clears; p++) {
+            epd_start_frame();
+            bool started = false;
+            int postSkip = 0;
+            for (int y = 0; y < EPD_HEIGHT; y++) {
+                if (y < area.y) { epd_skip(); continue; }
+                if (y >= area.y + area.height) {
+                    if (postSkip == 0) {
+                        epd_switch_buffer();
+                        memset(epd_get_current_buffer(), 0, EPD_WIDTH / 4);
+                        epd_switch_buffer();
+                        memset(epd_get_current_buffer(), 0, EPD_WIDTH / 4);
+                    }
+                    if (postSkip < 2) epd_output_row(10);
+                    else              epd_skip();
+                    postSkip++;
+                    continue;
+                }
+                if (!started) {
+                    epd_switch_buffer();
+                    memcpy(epd_get_current_buffer(), row_buf, EPD_WIDTH / 4);
+                    epd_switch_buffer();
+                    memcpy(epd_get_current_buffer(), row_buf, EPD_WIDTH / 4);
+                    started = true;
+                }
+                epd_output_row(time_dus);
+            }
+            memset(epd_get_current_buffer(), 0, EPD_WIDTH / 4);
+            epd_output_row(time_dus);
+            epd_end_frame();
+        }
+    }
+
+    // DU passes: per-pixel voltage from framebuffer content.
     for (int p = 0; p < passes; p++) {
         epd_start_frame();
         bool started = false;
+        int postSkip = 0;
+
         for (int y = 0; y < EPD_HEIGHT; y++) {
-            if (y < area.y || y >= area.y + area.height) {
+            if (y < area.y) {
                 epd_skip();
+                continue;
+            }
+            if (y >= area.y + area.height) {
+                // Zero both buffers on the first post-area row so the source
+                // outputs zero voltage after the inevitable 1-row pipeline bleed.
+                if (postSkip == 0) {
+                    epd_switch_buffer();
+                    memset(epd_get_current_buffer(), 0, EPD_WIDTH / 4);
+                    epd_switch_buffer();
+                    memset(epd_get_current_buffer(), 0, EPD_WIDTH / 4);
+                }
+                // Two output_rows: first latches last-area-row data (unavoidable),
+                // second latches zeros — all subsequent epd_skip()s see zero voltage.
+                if (postSkip < 2) epd_output_row(10);
+                else              epd_skip();
+                postSkip++;
                 continue;
             }
             _buildDuRow(row_buf, fb, y, area);
             if (!started) {
-                // Prime both I2S buffers with the first row so the pipeline
-                // starts cleanly regardless of previous buffer state.
                 epd_switch_buffer();
                 memcpy(epd_get_current_buffer(), row_buf, EPD_WIDTH / 4);
                 epd_switch_buffer();
                 memcpy(epd_get_current_buffer(), row_buf, EPD_WIDTH / 4);
                 started = true;
             } else {
-                // Other buffer is idle (DMA runs on its pair) — safe to write.
                 memcpy(epd_get_current_buffer(), row_buf, EPD_WIDTH / 4);
             }
             epd_output_row(time_dus);
         }
-        epd_output_row(time_dus);  // flush last row through the latch pipeline
+        memset(epd_get_current_buffer(), 0, EPD_WIDTH / 4);
+        epd_output_row(time_dus);
         epd_end_frame();
     }
 }
@@ -394,7 +452,7 @@ static void _renderLine(const char* oldStr, const char* newStr,
 
     if (pushR > pushL) {
         Rect_t r = {pushL, uY, pushR - pushL, uH};
-        _duUpdate(r, _fb, 300, 3);
+        _duUpdate(r, _fb, 200, 2, 2);
     }
 }
 
@@ -620,6 +678,280 @@ char Display::_hitTestKey(uint16_t tx, uint16_t ty, uint8_t mode) const {
             return keyMap[i];
     }
     return 0;
+}
+
+// ============================================================
+// keyboard() — multi-mode keyboard widget with rotation
+// ============================================================
+
+// Persists across keyboard() calls — toggled by the ROT button.
+static bool _kb2Rotated = false;
+
+// Layout (fits 960 × 540 exactly):
+//   Input row  :  80 px   — ROT button + text box
+//   OK zone    :  60 px   — small OK button floating above the 0 key column
+//   4 key rows : 100 px each  →  400 px
+//   Total      : 540 px  (no separator)
+//
+// Normal:  input(0..79) | ok(80..139) | keys(140..539)
+// Rotated: keys(0..399) | ok(400..459) | input(460..539)
+static constexpr int KB2_ROW_H  = 80;   // 5 QWERTY rows × 80 = 400 px
+static constexpr int KB2_IN_H   = 80;
+static constexpr int KB2_OK_H   = 60;
+
+// Layout is always drawn in normal orientation. When _kb2Rotated, the
+// framebuffer is flipped 180° in memory before being sent to the panel,
+// and touch coordinates are inverted — no layout changes needed.
+static int _kb2InY()       { return 0; }
+static int _kb2OkY()       { return KB2_IN_H; }
+static int _kb2RowY(int r) { return KB2_IN_H + KB2_OK_H + r * KB2_ROW_H; }
+
+// Rotate the framebuffer 180°: reverse row order AND reverse+nibble-swap each row.
+// Nibble swap is required because 4bpp stores two pixels per byte (even col = low
+// nibble, odd col = high nibble), so reversing column order also swaps the nibbles.
+static void _fb180Rotate() {
+    uint8_t tmp[EPD_WIDTH / 2];
+    for (int r = 0; r < EPD_HEIGHT / 2; r++) {
+        uint8_t *rowA = _fb + r                    * (EPD_WIDTH / 2);
+        uint8_t *rowB = _fb + (EPD_HEIGHT - 1 - r) * (EPD_WIDTH / 2);
+        for (int i = 0; i < EPD_WIDTH / 2; i++) {
+            uint8_t b = rowA[EPD_WIDTH / 2 - 1 - i];
+            tmp[i] = (b >> 4) | (b << 4);
+        }
+        for (int i = 0; i < EPD_WIDTH / 2; i++) {
+            uint8_t b = rowB[EPD_WIDTH / 2 - 1 - i];
+            rowA[i] = (b >> 4) | (b << 4);
+        }
+        memcpy(rowB, tmp, EPD_WIDTH / 2);
+    }
+}
+
+// QWERTY key X positions:
+//   Row 0/1 (10 keys): x = 4 + i*96,  w = 92
+//   Row 2   ( 9 keys): x = 48 + i*96, w = 92  (centred)
+//   Row 3 SFT:  x=0   w=142
+//   Row 3 z..m: x=146+i*96  w=92  (7 letters)
+//   Row 3 DEL:  x=818  w=142
+//   OK (QWERTY): floats in OK zone above 0 key (x=868, w=92) — text-width sized
+//
+// NUMPAD: 4 cols × w=236 step=240;  OK floats in OK zone above col 1 (x=240)
+
+void Display::_kb2DrawAll(KeyboardMode mode, bool shifted, const char* buf) {
+    _fbClear();
+
+    // Input row: ROT button left, text box right
+    int iy = _kb2InY();
+    _labelKey(3, (uint16_t)(iy+3), 63, (uint16_t)(KB2_IN_H-6), "\xE2\x86\xB7");
+    epd_draw_rect(70, iy+3, EPD_WIDTH-73, KB2_IN_H-6, EPD47_BLACK, _fb);
+    char curs[130];
+    snprintf(curs, sizeof(curs), "%s_", buf ? buf : "");
+    { int32_t tx = 78, ty = iy + 52;
+      writeln((GFXfont*)&MonoFont, curs, &tx, &ty, _fb); }
+
+    // OK zone: small button floating above the 0-key column
+    { int okW = _textWidth("OK") + 40;
+      int oy  = _kb2OkY();
+      int okX = (mode == KeyboardMode::NUMPAD)
+                ? 240 + (236 - okW) / 2          // above numpad col 1 (0 key)
+                : 868 + (92  - okW) / 2;          // above QWERTY 0 key
+      int okY = oy + (KB2_OK_H - KB2_ROW_H/2) / 2;  // vertically centred in zone
+      _labelKey((uint16_t)okX, (uint16_t)oy, (uint16_t)okW, (uint16_t)KB2_OK_H, "OK"); }
+
+    // Keyboard rows
+    char lbl[5];
+    if (mode == KeyboardMode::NUMPAD) {
+        static const char NP[4][4] = {
+            {'7','8','9','/'}, {'4','5','6','*'}, {'1','2','3','-'}, {'.','0',0,'+'}
+        };
+        for (int r = 0; r < 4; r++) {
+            int ry = _kb2RowY(r);
+            for (int c = 0; c < 4; c++) {
+                char ch = (r == 3 && c == 2) ? K_BKSP : NP[r][c];
+                if (ch == K_BKSP) strncpy(lbl, "DEL", 4);
+                else { lbl[0] = ch; lbl[1] = 0; }
+                _labelKey((uint16_t)(c*240), (uint16_t)ry, 236, KB2_ROW_H, lbl);
+            }
+        }
+    } else {
+        // Row 0: symbols
+        static const char SYM[12] = {'!','@','#','$','%','^','&','*','(',')','-','+'};
+        for (int i = 0; i < 12; i++) {
+            lbl[0] = SYM[i]; lbl[1] = 0;
+            _labelKey((uint16_t)(i*80), (uint16_t)_kb2RowY(0), 78, KB2_ROW_H, lbl);
+        }
+        // Row 1: 1..0
+        static const char NUMS[10] = {'1','2','3','4','5','6','7','8','9','0'};
+        for (int i = 0; i < 10; i++) {
+            lbl[0] = NUMS[i]; lbl[1] = 0;
+            _labelKey((uint16_t)(4+i*96), (uint16_t)_kb2RowY(1), 92, KB2_ROW_H, lbl);
+        }
+        // Row 2: QWERTY
+        const char* qw = shifted ? "QWERTYUIOP" : "qwertyuiop";
+        for (int i = 0; i < 10; i++) {
+            lbl[0] = qw[i]; lbl[1] = 0;
+            _labelKey((uint16_t)(4+i*96), (uint16_t)_kb2RowY(2), 92, KB2_ROW_H, lbl);
+        }
+        // Row 3: ASDF
+        const char* as = shifted ? "ASDFGHJKL" : "asdfghjkl";
+        for (int i = 0; i < 9; i++) {
+            lbl[0] = as[i]; lbl[1] = 0;
+            _labelKey((uint16_t)(48+i*96), (uint16_t)_kb2RowY(3), 92, KB2_ROW_H, lbl);
+        }
+        // Row 4: SFT + ZXCVBNM + DEL
+        _labelKey(0,   (uint16_t)_kb2RowY(4), 142, KB2_ROW_H, "SFT", shifted);
+        const char* zx = shifted ? "ZXCVBNM" : "zxcvbnm";
+        for (int i = 0; i < 7; i++) {
+            lbl[0] = zx[i]; lbl[1] = 0;
+            _labelKey((uint16_t)(146+i*96), (uint16_t)_kb2RowY(4), 92, KB2_ROW_H, lbl);
+        }
+        _labelKey(818, (uint16_t)_kb2RowY(4), 142, KB2_ROW_H, "DEL");
+    }
+}
+
+char Display::_kb2HitTest(uint16_t tx, uint16_t ty, KeyboardMode mode, bool shifted) const {
+    // OK zone (between input and keyboard rows)
+    { int oy = _kb2OkY();
+      if (ty >= oy && ty < oy + KB2_OK_H) {
+          int okW = _textWidth("OK") + 40;
+          int okX = (mode == KeyboardMode::NUMPAD)
+                    ? 240 + (236 - okW) / 2
+                    : 868 + (92  - okW) / 2;
+          return (tx >= okX && (int)tx < okX + okW) ? K_ENTER : 0; } }
+
+    if (mode == KeyboardMode::NUMPAD) {
+        static const char NP[4][4] = {
+            {'7','8','9','/'}, {'4','5','6','*'}, {'1','2','3','-'}, {'.','0',K_BKSP,'+'}
+        };
+        for (int r = 0; r < 4; r++) {
+            int ry = _kb2RowY(r);
+            if (ty < ry || ty >= ry + KB2_ROW_H) continue;
+            int c = tx / 240;
+            return (c >= 0 && c < 4) ? NP[r][c] : 0;
+        }
+        return 0;
+    }
+
+    // Row 0: symbols
+    { int ry = _kb2RowY(0);
+      if (ty >= ry && ty < ry + KB2_ROW_H) {
+          static const char SYM[12] = {'!','@','#','$','%','^','&','*','(',')','-','+'};
+          int i = (int)tx / 80;
+          return (i >= 0 && i < 12) ? SYM[i] : 0; } }
+    // Row 1: numbers
+    { int ry = _kb2RowY(1);
+      if (ty >= ry && ty < ry + KB2_ROW_H) {
+          static const char N[10] = {'1','2','3','4','5','6','7','8','9','0'};
+          int i = ((int)tx - 4) / 96;
+          return (i >= 0 && i < 10) ? N[i] : 0; } }
+    // Row 2: QWERTY
+    { int ry = _kb2RowY(2);
+      if (ty >= ry && ty < ry + KB2_ROW_H) {
+          const char* r = shifted ? "QWERTYUIOP" : "qwertyuiop";
+          int i = ((int)tx - 4) / 96;
+          return (i >= 0 && i < 10) ? r[i] : 0; } }
+    // Row 3: ASDF
+    { int ry = _kb2RowY(3);
+      if (ty >= ry && ty < ry + KB2_ROW_H) {
+          const char* r = shifted ? "ASDFGHJKL" : "asdfghjkl";
+          int i = ((int)tx - 48) / 96;
+          return (i >= 0 && i < 9) ? r[i] : 0; } }
+    // Row 4: SFT + ZXCVBNM + DEL
+    { int ry = _kb2RowY(4);
+      if (ty >= ry && ty < ry + KB2_ROW_H) {
+          if (tx < 142)  return K_SHIFT;
+          if (tx >= 818) return K_BKSP;
+          const char* r = shifted ? "ZXCVBNM" : "zxcvbnm";
+          int i = ((int)tx - 146) / 96;
+          return (i >= 0 && i < 7) ? r[i] : 0; } }
+    return 0;
+}
+
+bool Display::keyboard(char* buf, uint8_t maxLen, const char* prompt, KeyboardMode mode) {
+    if (!buf || maxLen < 2) return false;
+    buf[0] = '\0';
+    uint8_t len = 0;
+    bool shifted = false;
+
+    auto fullRedraw = [&]() {
+        _kb2DrawAll(mode, shifted, buf);
+        if (_kb2Rotated) _fb180Rotate();
+        epd_poweron();
+        Rect_t full = {0, 0, EPD_WIDTH, EPD_HEIGHT};
+        _duUpdate(full, _fb, 200, 0, 2);
+        _afterEpd();
+    };
+
+    // Fast path: only refresh the input row (80 px).
+    // For non-rotated: DU just rows 0..KB2_IN_H-1 — keyboard on panel is untouched.
+    // For rotated: fall back to full redraw (input is at panel bottom after the flip).
+    auto inputRedraw = [&]() {
+        epd_fill_rect(70, 3, EPD_WIDTH-73, KB2_IN_H-6, EPD47_WHITE, _fb);
+        char curs[130];
+        snprintf(curs, sizeof(curs), "%s_", buf);
+        int32_t itx = 78, ity = 52;
+        writeln((GFXfont*)&MonoFont, curs, &itx, &ity, _fb);
+        epd_poweron();
+        if (!_kb2Rotated) {
+            Rect_t r = {0, 0, EPD_WIDTH, KB2_IN_H};
+            _duUpdate(r, _fb, 200, 1, 1);
+        } else {
+            _kb2DrawAll(mode, shifted, buf);
+            _fb180Rotate();
+            Rect_t full = {0, 0, EPD_WIDTH, EPD_HEIGHT};
+            _duUpdate(full, _fb, 200, 0, 2);
+        }
+        _afterEpd();
+    };
+
+    fullRedraw();
+
+    while (true) {
+        uint16_t tx, ty;
+        if (!_gt911Read(tx, ty)) { delay(20); continue; }
+        waitRelease();
+        delay(40);
+
+        // Invert touch coordinates when rotated so hit tests always use normal space.
+        if (_kb2Rotated) {
+            tx = (uint16_t)(EPD_WIDTH  - 1 - tx);
+            ty = (uint16_t)(EPD_HEIGHT - 1 - ty);
+        }
+
+        // ROT button — top-left of input area (always at 0,0 in normal space)
+        if (tx >= 3 && tx < 66 && ty < (uint16_t)KB2_IN_H) {
+            _kb2Rotated = !_kb2Rotated;
+            epd_poweron();
+            epd_clear();
+            _afterEpd();
+            fullRedraw();
+            continue;
+        }
+
+        char ch = _kb2HitTest(tx, ty, mode, shifted);
+        if (ch == 0) continue;
+
+        switch (ch) {
+            case K_BKSP:
+                if (len > 0) { buf[--len] = '\0'; inputRedraw(); }
+                break;
+            case K_ENTER:
+                return len > 0;
+            case K_SHIFT:
+                shifted = !shifted;
+                fullRedraw();   // key labels change
+                break;
+            default:
+                if (len < maxLen - 1) {
+                    buf[len++] = ch;
+                    buf[len]   = '\0';
+                    bool wasShifted = shifted;
+                    shifted = false;
+                    if (wasShifted) fullRedraw();   // key labels revert to lower
+                    else            inputRedraw();  // text only
+                }
+                break;
+        }
+    }
 }
 
 // ============================================================
